@@ -11,3 +11,7 @@ certs/*.pem
 certs/*.csr
 certs/*.cnf
 certs/*.srl
+
+.identity/
+identities/
+client-identities/

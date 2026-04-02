@@ -16,7 +16,11 @@ class ProtocolError(Exception):
 
 
 _SCHEMAS: dict[str, dict[str, type | tuple[type, ...]]] = {
-    "register": {"username": str},
+    "register": {
+        "username": str,
+        "signing_public_key": str,
+        "key_agreement_public_key": str,
+    },
     "register_ok": {"username": str},
     "register_error": {"text": str},
     "list_users": {},

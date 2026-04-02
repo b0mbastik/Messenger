@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 import ssl
 import subprocess
@@ -11,6 +12,14 @@ import textwrap
 import unittest
 from pathlib import Path
 
+from identity import (
+    DEFAULT_IDENTITIES_DIR,
+    IdentityError,
+    default_identity_dir_for_username,
+    decode_key_bytes,
+    load_or_create_identity,
+    validate_public_identity,
+)
 from protocol import ProtocolError, read_message, send_message, validate_message
 from server import handle_client, shutdown_clients
 from storage import SessionStore
@@ -26,11 +35,15 @@ class TestPeer:
         port: int,
         ssl_context: ssl.SSLContext,
         server_name: str,
+        signing_public_key: str,
+        key_agreement_public_key: str,
     ) -> None:
         self.host = host
         self.port = port
         self.ssl_context = ssl_context
         self.server_name = server_name
+        self.signing_public_key = signing_public_key
+        self.key_agreement_public_key = key_agreement_public_key
         self.reader: asyncio.StreamReader | None = None
         self.writer: asyncio.StreamWriter | None = None
 
@@ -43,7 +56,14 @@ class TestPeer:
         )
 
     async def register(self, username: str) -> tuple[dict[str, object] | None, dict[str, object] | None]:
-        await self.send({"type": "register", "username": username})
+        await self.send(
+            {
+                "type": "register",
+                "username": username,
+                "signing_public_key": self.signing_public_key,
+                "key_agreement_public_key": self.key_agreement_public_key,
+            }
+        )
         response = await self.recv()
         if response is None or response["type"] != "register_ok":
             return response, None
@@ -203,7 +223,16 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
             await peer.close()
 
     async def make_peer(self) -> TestPeer:
-        peer = TestPeer(self.host, self.port, self.client_ssl_context, "localhost")
+        identity = load_or_create_identity(Path(self._cert_dir) / f"peer-{len(self.peers)}")
+        public_identity = identity.public_identity
+        peer = TestPeer(
+            self.host,
+            self.port,
+            self.client_ssl_context,
+            "localhost",
+            public_identity.signing_public_key,
+            public_identity.key_agreement_public_key,
+        )
         await peer.connect()
         self.peers.append(peer)
         return peer
@@ -403,6 +432,65 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
                 server_hostname="localhost",
             )
 
+    async def test_register_stores_public_identity_on_session(self) -> None:
+        alice = await self.make_peer()
+        await alice.register("alice")
+
+        session = self.store.get_by_username("alice")
+        assert session is not None
+        self.assertEqual(session.public_identity.signing_public_key, alice.signing_public_key)
+        self.assertEqual(
+            session.public_identity.key_agreement_public_key,
+            alice.key_agreement_public_key,
+        )
+
+    async def test_register_rejects_invalid_public_identity(self) -> None:
+        peer = await self.make_peer()
+        await peer.send(
+            {
+                "type": "register",
+                "username": "alice",
+                "signing_public_key": "not-base64",
+                "key_agreement_public_key": peer.key_agreement_public_key,
+            }
+        )
+        response = await peer.recv()
+        self.assertEqual(
+            response,
+            {
+                "type": "register_error",
+                "text": "Client identity error: Identity key data is not valid base64.",
+            },
+        )
+        self.assertIsNone(await peer.recv())
+
+    async def test_register_rejects_duplicate_active_signing_identity(self) -> None:
+        alice = await self.make_peer()
+        alias_peer = TestPeer(
+            self.host,
+            self.port,
+            self.client_ssl_context,
+            "localhost",
+            alice.signing_public_key,
+            alice.key_agreement_public_key,
+        )
+        await alias_peer.connect()
+        self.peers.append(alias_peer)
+
+        response, _ = await alice.register("alice")
+        self.assertEqual(response, {"type": "register_ok", "username": "alice"})
+
+        response, welcome = await alias_peer.register("alias")
+        self.assertEqual(
+            response,
+            {
+                "type": "register_error",
+                "text": "This long-term signing identity is already connected as another user.",
+            },
+        )
+        self.assertIsNone(welcome)
+        self.assertIsNone(await alias_peer.recv())
+
 
 class ProtocolValidationTests(unittest.TestCase):
     def test_validate_message_rejects_unknown_type(self) -> None:
@@ -416,6 +504,10 @@ class ProtocolValidationTests(unittest.TestCase):
     def test_validate_message_rejects_invalid_users_list(self) -> None:
         with self.assertRaises(ProtocolError):
             validate_message({"type": "users_list", "users": ["alice", ""]})
+
+    def test_validate_message_requires_identity_fields_for_register(self) -> None:
+        with self.assertRaises(ProtocolError):
+            validate_message({"type": "register", "username": "alice"})
 
 
 class TlsConfigurationTests(unittest.TestCase):
@@ -433,6 +525,65 @@ class TlsConfigurationTests(unittest.TestCase):
                     str(ca_cert),
                     minimum_version=ssl.TLSVersion.TLSv1_3,
                 )
+
+
+class IdentityTests(unittest.TestCase):
+    def test_default_identity_dir_uses_username(self) -> None:
+        expected = Path(DEFAULT_IDENTITIES_DIR) / "alice"
+        self.assertEqual(default_identity_dir_for_username("alice"), expected)
+
+    def test_default_identity_dir_sanitizes_username(self) -> None:
+        expected = Path(DEFAULT_IDENTITIES_DIR) / "alice_team_1"
+        self.assertEqual(default_identity_dir_for_username("alice/team#1"), expected)
+
+    def test_identity_persists_across_loads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            first = load_or_create_identity(temp_dir)
+            second = load_or_create_identity(temp_dir)
+
+            self.assertEqual(first.signing_fingerprint, second.signing_fingerprint)
+            self.assertEqual(
+                first.key_agreement_fingerprint,
+                second.key_agreement_fingerprint,
+            )
+
+    def test_identity_file_is_written(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            identity = load_or_create_identity(temp_dir)
+            payload = json.loads(identity.path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["version"], 1)
+            self.assertIn("signing_private_key", payload)
+            self.assertIn("key_agreement_private_key", payload)
+
+    def test_validate_public_identity_accepts_generated_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            identity = load_or_create_identity(temp_dir)
+            public_identity = identity.public_identity
+
+            validated = validate_public_identity(
+                public_identity.signing_public_key,
+                public_identity.key_agreement_public_key,
+            )
+            self.assertEqual(validated.signing_public_key, public_identity.signing_public_key)
+            self.assertEqual(
+                validated.key_agreement_public_key,
+                public_identity.key_agreement_public_key,
+            )
+
+    def test_validate_public_identity_rejects_malformed_key_length(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            identity = load_or_create_identity(temp_dir)
+            public_identity = identity.public_identity
+
+            with self.assertRaises(IdentityError):
+                validate_public_identity(
+                    public_identity.signing_public_key,
+                    "AQ==",
+                )
+
+    def test_decode_key_bytes_rejects_non_base64(self) -> None:
+        with self.assertRaises(IdentityError):
+            decode_key_bytes("bad@@@")
 
 
 if __name__ == "__main__":

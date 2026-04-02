@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import ssl
 
+from identity import IdentityError, validate_public_identity
 from protocol import DEFAULT_HOST, DEFAULT_PORT, ProtocolError, read_message, send_message
 from storage import SessionStore
 from tls_utils import build_server_ssl_context, parse_tls_version
@@ -81,6 +82,22 @@ async def handle_client(
             return
 
         username = first_message["username"].strip()
+        try:
+            public_identity = validate_public_identity(
+                first_message["signing_public_key"],
+                first_message["key_agreement_public_key"],
+            )
+        except IdentityError as exc:
+            await safe_send(
+                writer,
+                {
+                    "type": "register_error",
+                    "text": f"Client identity error: {exc}",
+                },
+            )
+            log(f"rejected registration from {address}: invalid identity ({exc})")
+            return
+
         if not is_valid_username(username):
             await safe_send(
                 writer,
@@ -92,15 +109,20 @@ async def handle_client(
             log(f"rejected registration from {address}: invalid username '{username}'")
             return
 
-        if not store.register(username, writer, address):
+        registered, error = store.register(username, writer, address, public_identity)
+        if not registered:
+            if error == "signing identity is already connected":
+                text = "This long-term signing identity is already connected as another user."
+            else:
+                text = f"Username '{username}' is already connected."
             await safe_send(
                 writer,
                 {
                     "type": "register_error",
-                    "text": f"Username '{username}' is already connected.",
+                    "text": text,
                 },
             )
-            log(f"rejected registration from {address}: duplicate username '{username}'")
+            log(f"rejected registration from {address}: {error} ('{username}')")
             return
 
         await send_message(writer, {"type": "register_ok", "username": username})
@@ -111,7 +133,12 @@ async def handle_client(
                 "text": f"Welcome, {username}. Type /help to see commands.",
             },
         )
-        log(f"registered {username} from {address}")
+        log(
+            "registered "
+            f"{username} from {address} "
+            f"(sign={public_identity.signing_fingerprint[:16]}, "
+            f"x25519={public_identity.key_agreement_fingerprint[:16]})"
+        )
 
         while True:
             message = await read_message(reader)

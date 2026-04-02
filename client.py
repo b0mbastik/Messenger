@@ -4,9 +4,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from pathlib import Path
 import ssl
 import sys
 
+from identity import (
+    ClientIdentity,
+    IdentityError,
+    default_identity_dir_for_username,
+    load_or_create_identity,
+)
 from protocol import DEFAULT_HOST, DEFAULT_PORT, ProtocolError, read_message, send_message
 from tls_utils import build_client_ssl_context, parse_tls_version
 
@@ -38,6 +45,11 @@ def parse_args() -> argparse.Namespace:
         choices=("1.2", "1.3"),
         default="1.3",
         help="Minimum TLS version to require. Defaults to 1.3.",
+    )
+    parser.add_argument(
+        "--identity-dir",
+        default=None,
+        help="Directory used to store this client's long-term identity keys",
     )
     return parser.parse_args()
 
@@ -96,11 +108,14 @@ class MessengerClient:
         port: int,
         ssl_context: ssl.SSLContext,
         server_name: str,
+        identity_dir: str | None,
     ) -> None:
         self.host = host
         self.port = port
         self.ssl_context = ssl_context
         self.server_name = server_name
+        self.identity_dir = identity_dir
+        self.identity: ClientIdentity | None = None
         self.username: str | None = None
         self.stop_event = asyncio.Event()
         self.reader: asyncio.StreamReader | None = None
@@ -158,8 +173,18 @@ class MessengerClient:
                 )
                 continue
 
-            await send_message(self.writer, {"type": "register", "username": username})
-
+            identity = load_or_create_identity(self.resolve_identity_dir(username))
+            self.identity = identity
+            print_line(
+                "[system]: ",
+                "identity loaded "
+                f"from {identity.path.parent} "
+                f"(sign={identity.signing_fingerprint[:16]}, "
+                f"x25519={identity.key_agreement_fingerprint[:16]})",
+            )
+            register_message = {"type": "register", "username": username}
+            register_message.update(identity.public_identity.as_message_fields())
+            await send_message(self.writer, register_message)
             response = await read_message(
                 self.reader, allowed_types={"register_ok", "register_error", "system_message"}
             )
@@ -176,6 +201,11 @@ class MessengerClient:
                 return
 
             print_line("[error]: ", response["text"])
+
+    def resolve_identity_dir(self, username: str) -> Path:
+        if self.identity_dir:
+            return Path(self.identity_dir)
+        return default_identity_dir_for_username(username)
 
     async def command_loop(self, stdin_reader: asyncio.StreamReader) -> None:
         assert self.writer is not None
@@ -323,6 +353,7 @@ async def main_async() -> None:
         args.port,
         ssl_context,
         args.server_name or args.host,
+        args.identity_dir,
     )
     await client.run()
 
@@ -336,6 +367,8 @@ def main() -> None:
         print_line("[error]: ", "could not connect to the server")
     except ssl.SSLError as exc:
         print_line("[error]: ", f"TLS error: {exc}")
+    except IdentityError as exc:
+        print_line("[error]: ", f"identity error: {exc}")
     except OSError as exc:
         print_line("[error]: ", str(exc))
 
