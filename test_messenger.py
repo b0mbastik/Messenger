@@ -1,26 +1,46 @@
-"""Integration and protocol tests for the plaintext terminal messenger."""
+"""Integration and protocol tests for the TLS messenger."""
 
 from __future__ import annotations
 
 import asyncio
+import shutil
+import ssl
+import subprocess
+import tempfile
+import textwrap
 import unittest
+from pathlib import Path
 
 from protocol import ProtocolError, read_message, send_message, validate_message
 from server import handle_client, shutdown_clients
 from storage import SessionStore
+from tls_utils import build_client_ssl_context, build_server_ssl_context, parse_tls_version
 
 
 class TestPeer:
     """Small async client used to exercise the server in tests."""
 
-    def __init__(self, host: str, port: int) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        ssl_context: ssl.SSLContext,
+        server_name: str,
+    ) -> None:
         self.host = host
         self.port = port
+        self.ssl_context = ssl_context
+        self.server_name = server_name
         self.reader: asyncio.StreamReader | None = None
         self.writer: asyncio.StreamWriter | None = None
 
     async def connect(self) -> None:
-        self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
+        self.reader, self.writer = await asyncio.open_connection(
+            self.host,
+            self.port,
+            ssl=self.ssl_context,
+            server_hostname=self.server_name,
+        )
 
     async def register(self, username: str) -> tuple[dict[str, object] | None, dict[str, object] | None]:
         await self.send({"type": "register", "username": username})
@@ -51,12 +71,125 @@ class TestPeer:
 
 
 class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        openssl = shutil.which("openssl")
+        if openssl is None:
+            raise unittest.SkipTest("openssl is required to generate test TLS certificates")
+
+        cls._temp_dir = tempfile.TemporaryDirectory()
+        cls._cert_dir = Path(cls._temp_dir.name)
+        cls._ca_cert = cls._cert_dir / "ca-cert.pem"
+        cls._ca_key = cls._cert_dir / "ca-key.pem"
+        cls._server_key = cls._cert_dir / "server-key.pem"
+        cls._server_csr = cls._cert_dir / "server.csr"
+        cls._server_cert = cls._cert_dir / "server-cert.pem"
+        cls._server_ext = cls._cert_dir / "server-ext.cnf"
+
+        cls._server_ext.write_text(
+            textwrap.dedent(
+                """
+                basicConstraints=critical,CA:false
+                keyUsage=critical,digitalSignature,keyEncipherment
+                subjectAltName=DNS:localhost,IP:127.0.0.1
+                extendedKeyUsage=serverAuth
+                subjectKeyIdentifier=hash
+                authorityKeyIdentifier=keyid,issuer
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        subprocess.run(
+            [
+                openssl,
+                "req",
+                "-x509",
+                "-new",
+                "-nodes",
+                "-days",
+                "1",
+                "-newkey",
+                "rsa:2048",
+                "-keyout",
+                str(cls._ca_key),
+                "-out",
+                str(cls._ca_cert),
+                "-subj",
+                "/CN=Messenger Test CA",
+                "-addext",
+                "basicConstraints=critical,CA:true",
+                "-addext",
+                "keyUsage=critical,keyCertSign,cRLSign",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [
+                openssl,
+                "req",
+                "-new",
+                "-nodes",
+                "-newkey",
+                "rsa:2048",
+                "-keyout",
+                str(cls._server_key),
+                "-out",
+                str(cls._server_csr),
+                "-subj",
+                "/CN=localhost",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [
+                openssl,
+                "x509",
+                "-req",
+                "-days",
+                "1",
+                "-in",
+                str(cls._server_csr),
+                "-CA",
+                str(cls._ca_cert),
+                "-CAkey",
+                str(cls._ca_key),
+                "-CAcreateserial",
+                "-out",
+                str(cls._server_cert),
+                "-extfile",
+                str(cls._server_ext),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._temp_dir.cleanup()
+
     async def asyncSetUp(self) -> None:
         self.store = SessionStore()
+        self.server_ssl_context = build_server_ssl_context(
+            str(self._server_cert),
+            str(self._server_key),
+            minimum_version=ssl.TLSVersion.TLSv1_3,
+        )
+        self.client_ssl_context = build_client_ssl_context(
+            str(self._ca_cert),
+            minimum_version=ssl.TLSVersion.TLSv1_3,
+        )
         self.server = await asyncio.start_server(
             lambda reader, writer: handle_client(reader, writer, self.store),
             "127.0.0.1",
             0,
+            ssl=self.server_ssl_context,
         )
         socket = self.server.sockets[0]
         self.host, self.port = socket.getsockname()[:2]
@@ -70,7 +203,7 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
             await peer.close()
 
     async def make_peer(self) -> TestPeer:
-        peer = TestPeer(self.host, self.port)
+        peer = TestPeer(self.host, self.port, self.client_ssl_context, "localhost")
         await peer.connect()
         self.peers.append(peer)
         return peer
@@ -258,6 +391,18 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(await alice.recv())
 
+    async def test_client_rejects_server_with_untrusted_ca(self) -> None:
+        wrong_ca_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        wrong_ca_context.minimum_version = ssl.TLSVersion.TLSv1_3
+
+        with self.assertRaises(ssl.SSLCertVerificationError):
+            await asyncio.open_connection(
+                self.host,
+                self.port,
+                ssl=wrong_ca_context,
+                server_hostname="localhost",
+            )
+
 
 class ProtocolValidationTests(unittest.TestCase):
     def test_validate_message_rejects_unknown_type(self) -> None:
@@ -271,6 +416,23 @@ class ProtocolValidationTests(unittest.TestCase):
     def test_validate_message_rejects_invalid_users_list(self) -> None:
         with self.assertRaises(ProtocolError):
             validate_message({"type": "users_list", "users": ["alice", ""]})
+
+
+class TlsConfigurationTests(unittest.TestCase):
+    def test_parse_tls_version(self) -> None:
+        self.assertEqual(parse_tls_version("1.2"), ssl.TLSVersion.TLSv1_2)
+        self.assertEqual(parse_tls_version("1.3"), ssl.TLSVersion.TLSv1_3)
+
+    def test_client_context_requires_peer_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ca_cert = Path(temp_dir) / "ca-cert.pem"
+            ca_cert.write_text("", encoding="utf-8")
+
+            with self.assertRaises(ssl.SSLError):
+                build_client_ssl_context(
+                    str(ca_cert),
+                    minimum_version=ssl.TLSVersion.TLSv1_3,
+                )
 
 
 if __name__ == "__main__":

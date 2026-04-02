@@ -1,18 +1,36 @@
-"""Async plaintext messaging server for the baseline messenger."""
+"""Async TLS-protected messaging server for the terminal messenger."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import ssl
 
 from protocol import DEFAULT_HOST, DEFAULT_PORT, ProtocolError, read_message, send_message
 from storage import SessionStore
+from tls_utils import build_server_ssl_context, parse_tls_version
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Plaintext terminal messenger server")
+    parser = argparse.ArgumentParser(description="TLS-protected terminal messenger server")
     parser.add_argument("--host", default=DEFAULT_HOST, help="Host to bind to")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port to bind to")
+    parser.add_argument(
+        "--certfile",
+        default="certs/server-cert.pem",
+        help="Path to the TLS server certificate PEM file",
+    )
+    parser.add_argument(
+        "--keyfile",
+        default="certs/server-key.pem",
+        help="Path to the TLS server private key PEM file",
+    )
+    parser.add_argument(
+        "--tls-min-version",
+        choices=("1.2", "1.3"),
+        default="1.3",
+        help="Minimum TLS version to allow. Defaults to 1.3.",
+    )
     return parser.parse_args()
 
 
@@ -25,6 +43,17 @@ def format_address(writer: asyncio.StreamWriter) -> str:
     if isinstance(peer, tuple) and len(peer) >= 2:
         return f"{peer[0]}:{peer[1]}"
     return str(peer or "unknown")
+
+
+def format_tls_details(writer: asyncio.StreamWriter) -> str:
+    ssl_object = writer.get_extra_info("ssl_object")
+    if ssl_object is None:
+        return "without TLS"
+
+    protocol = ssl_object.version() or "unknown TLS version"
+    cipher = ssl_object.cipher()
+    cipher_name = cipher[0] if cipher else "unknown cipher"
+    return f"using {protocol} ({cipher_name})"
 
 
 def is_valid_username(username: str) -> bool:
@@ -43,7 +72,7 @@ async def handle_client(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter, store: SessionStore
 ) -> None:
     address = format_address(writer)
-    log(f"connect {address}")
+    log(f"connect {address} {format_tls_details(writer)}")
 
     try:
         first_message = await read_message(reader, allowed_types={"register"})
@@ -224,12 +253,13 @@ async def shutdown_clients(store: SessionStore) -> None:
             pass
 
 
-async def run_server(host: str, port: int) -> None:
+async def run_server(host: str, port: int, ssl_context: ssl.SSLContext) -> None:
     store = SessionStore()
     server = await asyncio.start_server(
         lambda reader, writer: handle_client(reader, writer, store),
         host,
         port,
+        ssl=ssl_context,
     )
 
     sockets = server.sockets or []
@@ -250,9 +280,16 @@ async def run_server(host: str, port: int) -> None:
 def main() -> None:
     args = parse_args()
     try:
-        asyncio.run(run_server(args.host, args.port))
+        ssl_context = build_server_ssl_context(
+            args.certfile,
+            args.keyfile,
+            minimum_version=parse_tls_version(args.tls_min_version),
+        )
+        asyncio.run(run_server(args.host, args.port, ssl_context))
     except KeyboardInterrupt:
         log("stopped by keyboard interrupt")
+    except (OSError, ssl.SSLError) as exc:
+        log(f"TLS setup error: {exc}")
 
 
 if __name__ == "__main__":

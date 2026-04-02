@@ -1,12 +1,14 @@
-"""Async terminal client for the baseline plaintext messenger."""
+"""Async terminal client for the TLS-protected messenger."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import ssl
 import sys
 
 from protocol import DEFAULT_HOST, DEFAULT_PORT, ProtocolError, read_message, send_message
+from tls_utils import build_client_ssl_context, parse_tls_version
 
 
 HELP_TEXT = """Available commands:
@@ -18,9 +20,25 @@ HELP_TEXT = """Available commands:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Plaintext terminal messenger client")
+    parser = argparse.ArgumentParser(description="TLS-protected terminal messenger client")
     parser.add_argument("--host", default=DEFAULT_HOST, help="Server host")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Server port")
+    parser.add_argument(
+        "--ca-cert",
+        default="certs/ca-cert.pem",
+        help="Path to the CA certificate PEM file used to verify the server",
+    )
+    parser.add_argument(
+        "--server-name",
+        default=None,
+        help="TLS server name for certificate verification. Defaults to the host value.",
+    )
+    parser.add_argument(
+        "--tls-min-version",
+        choices=("1.2", "1.3"),
+        default="1.3",
+        help="Minimum TLS version to require. Defaults to 1.3.",
+    )
     return parser.parse_args()
 
 
@@ -72,21 +90,34 @@ async def prompt_line(
 
 
 class MessengerClient:
-    def __init__(self, host: str, port: int) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        ssl_context: ssl.SSLContext,
+        server_name: str,
+    ) -> None:
         self.host = host
         self.port = port
+        self.ssl_context = ssl_context
+        self.server_name = server_name
         self.username: str | None = None
         self.stop_event = asyncio.Event()
         self.reader: asyncio.StreamReader | None = None
         self.writer: asyncio.StreamWriter | None = None
 
     async def run(self) -> None:
-        print("Plaintext Messenger")
-        print(f"Connecting to {self.host}:{self.port} ...")
-        self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
+        print("TLS Messenger")
+        print(f"Connecting securely to {self.host}:{self.port} ...")
+        self.reader, self.writer = await asyncio.open_connection(
+            self.host,
+            self.port,
+            ssl=self.ssl_context,
+            server_hostname=self.server_name,
+        )
         stdin_reader = await open_stdin_reader()
 
-        print_line("[system]: ", "connected")
+        print_line("[system]: ", f"connected with {self.tls_details()}")
         await self.register(stdin_reader)
         print(HELP_TEXT)
 
@@ -98,6 +129,17 @@ class MessengerClient:
             receiver_task.cancel()
             await asyncio.gather(receiver_task, return_exceptions=True)
             await self.close()
+
+    def tls_details(self) -> str:
+        assert self.writer is not None
+        ssl_object = self.writer.get_extra_info("ssl_object")
+        if ssl_object is None:
+            return "no TLS"
+
+        protocol = ssl_object.version() or "unknown TLS version"
+        cipher = ssl_object.cipher()
+        cipher_name = cipher[0] if cipher else "unknown cipher"
+        return f"{protocol} ({cipher_name})"
 
     async def register(self, stdin_reader: asyncio.StreamReader) -> None:
         assert self.reader is not None
@@ -272,7 +314,16 @@ class MessengerClient:
 
 async def main_async() -> None:
     args = parse_args()
-    client = MessengerClient(args.host, args.port)
+    ssl_context = build_client_ssl_context(
+        args.ca_cert,
+        minimum_version=parse_tls_version(args.tls_min_version),
+    )
+    client = MessengerClient(
+        args.host,
+        args.port,
+        ssl_context,
+        args.server_name or args.host,
+    )
     await client.run()
 
 
@@ -283,6 +334,8 @@ def main() -> None:
         print_line("[system]: ", "client stopped")
     except ConnectionRefusedError:
         print_line("[error]: ", "could not connect to the server")
+    except ssl.SSLError as exc:
+        print_line("[error]: ", f"TLS error: {exc}")
     except OSError as exc:
         print_line("[error]: ", str(exc))
 
