@@ -1,18 +1,24 @@
 # TLS Terminal Messenger
 
-This project is a minimal terminal-based client/server messenger written in Python. Clients connect to the server over TLS, register usernames, list connected users, send direct messages, and optionally rename themselves.
+This project is a minimal terminal-based client/server messenger written in Python. Clients connect to the server over TLS, register usernames, list connected users, and send direct messages.
 
-This version now protects the client-server transport with TLS and server certificate verification. Each client also has its own long-term identity keys: one Ed25519 key for signatures and one X25519 key for key agreement. It still does not provide end-to-end encryption, user accounts, passwords, message signatures in the chat flow, or client certificate authentication yet. The goal is to secure the transport first, then build the application-layer crypto.
+The transport is protected with TLS and server certificate verification. Each client has a long-term Ed25519 identity key and a long-term X25519 key-agreement key. User trust is handled with a small local CA and a persistent server-side account registry:
+
+`CA -> username -> Ed25519 identity key -> X25519 key`
+
+On first registration the server checks that the username is free, issues a certificate for the user's Ed25519 identity key, and stores the permanent binding. On later logins the client presents that stored certificate and the server verifies the binding before allowing the session.
 
 ## Files
 
-- `server.py`: asyncio TCP server that accepts clients and routes messages
+- `server.py`: asyncio TCP server that accepts clients, registers users, and routes messages
 - `client.py`: terminal client with interactive commands
 - `protocol.py`: newline-delimited JSON framing and protocol validation
-- `storage.py`: in-memory connected-user session store
+- `storage.py`: in-memory connected-session store
+- `accounts.py`: persistent account registry for long-term username bindings
 - `identity.py`: long-term Ed25519/X25519 identity key management
+- `cert_utils.py`: CA-backed X.509 certificate issuance and verification helpers
 - `tls_utils.py`: TLS context configuration helpers
-- `generate_dev_certs.sh`: helper script for local CA and server certificate generation
+- `setup_messenger.sh`: one-step setup script for the CA and server certificate
 - `requirements.txt`: dependency file for the project
 
 ## Requirements
@@ -27,17 +33,18 @@ Install Python dependencies with:
 python3 -m pip install -r requirements.txt
 ```
 
-## How to Run
+## Initial Setup
 
-## Generate Development Certificates
-
-The easiest way to generate a correct local CA and server certificate is:
+Run the setup script once:
 
 ```bash
-./generate_dev_certs.sh
+./setup_messenger.sh
 ```
 
-This script creates the `certs/` directory automatically, then writes a CA certificate with the required CA extensions and a server certificate valid for both `localhost` and `127.0.0.1`.
+It creates:
+
+- `certs/ca-cert.pem` and `certs/ca-key.pem`
+- `certs/server-cert.pem` and `certs/server-key.pem`
 
 If you want to generate them manually, use these exact commands.
 
@@ -86,7 +93,7 @@ openssl x509 -req -days 365 \
   -extfile certs/server-ext.cnf
 ```
 
-If you previously generated certificates using the older instructions, delete the old files in `certs/` and regenerate them. The old CA certificate is what triggers:
+If you previously generated certificates using older instructions, delete the old files in `certs/` and regenerate them. An older CA without the proper extensions can trigger:
 
 ```text
 [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: CA cert does not include key usage extension
@@ -106,6 +113,9 @@ Optional arguments:
 python3 server.py --host 127.0.0.1 --port 8888 \
   --certfile certs/server-cert.pem \
   --keyfile certs/server-key.pem \
+  --ca-cert certs/ca-cert.pem \
+  --ca-key certs/ca-key.pem \
+  --accounts-file data/accounts.json \
   --tls-min-version 1.3
 ```
 
@@ -131,28 +141,47 @@ Default connection settings:
 - Port: `8888`
 - Minimum TLS version: `1.3`
 - Default identity directory: `identities/<username>`
+- Default account registry: `data/accounts.json`
 
-## Long-Term Client Identity Keys
+## Registration and Login
 
 Each client profile stores two long-term private keys locally:
 
-- Ed25519 for future signing and identity verification
-- X25519 for future key agreement
+- Ed25519 as the certified long-term signing and identity key
+- X25519 as the long-term key-agreement key
 
-The client stores them in `identity.json` inside the selected identity directory. By default, if you do not pass `--identity-dir`, the client uses `identities/<username>` after you enter the username. On first use the keys are generated automatically; on later runs they are loaded from disk and reused.
+The client stores them in `identity.json` inside the selected identity directory. By default, if you do not pass `--identity-dir`, the client uses `identities/<username>` after you enter the username.
 
-If you want multiple local clients to have different long-term identities on the same machine, give each one a different identity directory, for example:
+On first use for a new username:
+
+- the client asks for a username
+- the client generates or loads the local Ed25519/X25519 identity
+- the client sends the username, the two public keys, and an Ed25519 signature over `username || X25519 public key`
+- if the username is free, the server signs and returns a client certificate for that username and Ed25519 key
+- the client stores that certificate locally as `identity-cert.pem`
+
+On later logins:
+
+- the client loads the stored certificate
+- the client sends the certificate plus the identity bundle
+- the server verifies that the certificate is signed by the CA
+- the server verifies that the certificate subject matches the username
+- the server verifies that the Ed25519 key matches the certificate
+- the server verifies that the Ed25519 key signs the current X25519 key
+
+The server stores the permanent username binding in `data/accounts.json`, so usernames remain bound to the same Ed25519 identity across server restarts.
+
+Because the username is part of the long-term identity:
+
+- usernames are permanent once registered
+- rename is intentionally rejected
+- if a user loses their private keys, account recovery is out of scope
+
+If you want multiple local clients on the same machine, give each one a different identity directory, for example:
 
 ```bash
 python3 client.py --identity-dir client-identities/alice
 python3 client.py --identity-dir client-identities/bob
-```
-
-If you do not pass `--identity-dir`, these two commands now also work safely by default because the identity path is derived from the username you enter in each client:
-
-```bash
-python3 client.py
-python3 client.py
 ```
 
 ## Client Commands
@@ -160,14 +189,13 @@ python3 client.py
 - `/help` show available commands
 - `/users` request the list of connected users
 - `/msg <user> <text>` send a direct message to a connected user
-- `/name <new_name>` change your username if the new name is available
 - `/quit` disconnect cleanly and exit
 
 ## Example Session
 
 1. Start `server.py`.
 2. Open two terminals and run `client.py` in each.
-3. Register usernames such as `alice` and `bob`.
+3. On first use, register usernames such as `alice` and `bob`.
 4. From Alice's client, run:
 
 ```text
@@ -183,24 +211,22 @@ python3 client.py
 ## Current Limitations
 
 - No end-to-end encryption yet
-- No user authentication
-- No passwords or accounts
-- No client certificate authentication
-- Long-term identity keys exist but are not yet used to sign chat messages
+- No password-based accounts
+- No application-layer message signatures yet
 - No offline message delivery
-- No persistent storage or database
-- Connected users and their public identity keys are stored in memory only
+- No message history or persistent message storage
+- Connected sessions are stored in memory only while users are online
 - Direct messages only, no group chats
 
 ## Extension Path
 
 This layout is designed to be extended later with:
 
-- Authentication and identity management
-- Public/private key infrastructure
-- End-to-end encryption
-- Signed messages
-- Persistent or offline message storage
+- end-to-end encryption
+- signed application messages
+- persistent or offline message storage
+- richer account management
+- group chats
 
 ## Testing
 

@@ -18,9 +18,12 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey,
     X25519PublicKey,
 )
+from cryptography.exceptions import InvalidSignature
 
 IDENTITY_FILE = "identity.json"
+IDENTITY_CERT_FILE = "identity-cert.pem"
 DEFAULT_IDENTITIES_DIR = "identities"
+KEY_AGREEMENT_BINDING_CONTEXT = b"messenger-key-agreement:v1"
 
 
 class IdentityError(Exception):
@@ -101,6 +104,17 @@ class ClientIdentity:
     def key_agreement_fingerprint(self) -> str:
         return self.public_identity.key_agreement_fingerprint
 
+    def sign_key_agreement_binding(self, username: str) -> str:
+        """Sign the user's X25519 public key with the long-term Ed25519 identity."""
+
+        signature = self.signing_private_key.sign(
+            build_key_agreement_binding_payload(
+                username,
+                self.public_identity.key_agreement_public_key,
+            )
+        )
+        return encode_public_key_bytes(signature)
+
 
 def load_or_create_identity(identity_dir: str | Path) -> ClientIdentity:
     """Load an existing client identity or create a new one."""
@@ -133,6 +147,12 @@ def default_identity_dir_for_username(username: str) -> Path:
     if not safe_username:
         safe_username = "user"
     return Path(DEFAULT_IDENTITIES_DIR) / safe_username
+
+
+def default_certificate_path(identity_dir: str | Path) -> Path:
+    """Return the default path for a client identity certificate."""
+
+    return Path(identity_dir) / IDENTITY_CERT_FILE
 
 
 def load_identity(identity_path: str | Path) -> ClientIdentity:
@@ -199,6 +219,40 @@ def validate_public_identity(
         signing_public_key=encode_public_key_bytes(signing_bytes),
         key_agreement_public_key=encode_public_key_bytes(agreement_bytes),
     )
+
+
+def build_key_agreement_binding_payload(
+    username: str, key_agreement_public_key: str
+) -> bytes:
+    """Return the canonical payload signed to bind a user to an X25519 key."""
+
+    username_bytes = username.encode("utf-8")
+    if not username_bytes.strip():
+        raise IdentityError("Username must be present to bind the key-agreement key.")
+
+    key_bytes = decode_key_bytes(key_agreement_public_key)
+    return (
+        KEY_AGREEMENT_BINDING_CONTEXT
+        + b"\x00"
+        + username_bytes
+        + b"\x00"
+        + key_bytes
+    )
+
+
+def verify_key_agreement_binding(
+    signing_public_key: str, username: str, key_agreement_public_key: str, signature: str
+) -> None:
+    """Verify that an Ed25519 identity key signed the supplied X25519 key."""
+
+    public_key = Ed25519PublicKey.from_public_bytes(decode_key_bytes(signing_public_key))
+    try:
+        public_key.verify(
+            decode_key_bytes(signature),
+            build_key_agreement_binding_payload(username, key_agreement_public_key),
+        )
+    except InvalidSignature as exc:
+        raise IdentityError("Key-agreement public key signature is invalid.") from exc
 
 
 def encode_private_key_bytes(data: bytes) -> str:

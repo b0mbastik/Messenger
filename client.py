@@ -10,6 +10,7 @@ import sys
 
 from identity import (
     ClientIdentity,
+    default_certificate_path,
     IdentityError,
     default_identity_dir_for_username,
     load_or_create_identity,
@@ -22,7 +23,6 @@ HELP_TEXT = """Available commands:
 /help                  show this help text
 /users                 list currently connected users
 /msg <user> <text>     send a direct message
-/name <new_name>       change your username
 /quit                  disconnect and exit"""
 
 
@@ -50,6 +50,11 @@ def parse_args() -> argparse.Namespace:
         "--identity-dir",
         default=None,
         help="Directory used to store this client's long-term identity keys",
+    )
+    parser.add_argument(
+        "--client-cert",
+        default=None,
+        help="Path to the CA-signed client identity certificate PEM file",
     )
     return parser.parse_args()
 
@@ -109,12 +114,14 @@ class MessengerClient:
         ssl_context: ssl.SSLContext,
         server_name: str,
         identity_dir: str | None,
+        client_cert: str | None,
     ) -> None:
         self.host = host
         self.port = port
         self.ssl_context = ssl_context
         self.server_name = server_name
         self.identity_dir = identity_dir
+        self.client_cert = client_cert
         self.identity: ClientIdentity | None = None
         self.username: str | None = None
         self.stop_event = asyncio.Event()
@@ -133,7 +140,7 @@ class MessengerClient:
         stdin_reader = await open_stdin_reader()
 
         print_line("[system]: ", f"connected with {self.tls_details()}")
-        await self.register(stdin_reader)
+        await self.authenticate(stdin_reader)
         print(HELP_TEXT)
 
         receiver_task = asyncio.create_task(self.receive_loop())
@@ -156,7 +163,7 @@ class MessengerClient:
         cipher_name = cipher[0] if cipher else "unknown cipher"
         return f"{protocol} ({cipher_name})"
 
-    async def register(self, stdin_reader: asyncio.StreamReader) -> None:
+    async def authenticate(self, stdin_reader: asyncio.StreamReader) -> None:
         assert self.reader is not None
         assert self.writer is not None
 
@@ -175,6 +182,9 @@ class MessengerClient:
 
             identity = load_or_create_identity(self.resolve_identity_dir(username))
             self.identity = identity
+            certificate_path = self.resolve_certificate_path(identity)
+            certificate_pem = self.load_identity_certificate(identity)
+            is_first_registration = certificate_pem is None
             print_line(
                 "[system]: ",
                 "identity loaded "
@@ -182,18 +192,31 @@ class MessengerClient:
                 f"(sign={identity.signing_fingerprint[:16]}, "
                 f"x25519={identity.key_agreement_fingerprint[:16]})",
             )
-            register_message = {"type": "register", "username": username}
-            register_message.update(identity.public_identity.as_message_fields())
-            await send_message(self.writer, register_message)
+            auth_message = {
+                "type": "register" if is_first_registration else "login",
+                "username": username,
+            }
+            auth_message.update(
+                {
+                    **identity.public_identity.as_message_fields(),
+                    "key_agreement_signature": identity.sign_key_agreement_binding(username),
+                }
+            )
+            if certificate_pem is not None:
+                auth_message["identity_certificate"] = certificate_pem
+
+            await send_message(self.writer, auth_message)
             response = await read_message(
                 self.reader, allowed_types={"register_ok", "register_error", "system_message"}
             )
             if response is None:
-                raise ConnectionError("server closed the connection during registration")
+                raise ConnectionError("server closed the connection during authentication")
 
             if response["type"] == "register_ok":
                 self.username = response["username"]
-                print_line("[system]: ", f"registered as {self.username}")
+                self.save_identity_certificate(certificate_path, str(response["identity_certificate"]))
+                status = "registered" if is_first_registration else "authenticated"
+                print_line("[system]: ", f"{status} as {self.username}")
 
                 welcome = await read_message(self.reader, allowed_types={"system_message"})
                 if welcome is not None:
@@ -206,6 +229,22 @@ class MessengerClient:
         if self.identity_dir:
             return Path(self.identity_dir)
         return default_identity_dir_for_username(username)
+
+    def resolve_certificate_path(self, identity: ClientIdentity) -> Path:
+        if self.client_cert:
+            return Path(self.client_cert)
+        return default_certificate_path(identity.path.parent)
+
+    def load_identity_certificate(self, identity: ClientIdentity) -> str | None:
+        certificate_path = self.resolve_certificate_path(identity)
+        try:
+            return certificate_path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+
+    def save_identity_certificate(self, path: Path, certificate_pem: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(certificate_pem, encoding="utf-8")
 
     async def command_loop(self, stdin_reader: asyncio.StreamReader) -> None:
         assert self.writer is not None
@@ -244,17 +283,9 @@ class MessengerClient:
                 continue
 
             if command.startswith("/name "):
-                new_name = command[6:].strip()
-                if not is_valid_username(new_name):
-                    print_line(
-                        "[error]: ",
-                        "Username must be 1-32 characters and contain no spaces.",
-                    )
-                    continue
-
-                await send_message(
-                    self.writer,
-                    {"type": "rename", "new_username": new_name},
+                print_line(
+                    "[error]: ",
+                    "Usernames are bound to CA-signed certificates and cannot be changed.",
                 )
                 continue
 
@@ -307,11 +338,6 @@ class MessengerClient:
             print_line("[system]: ", str(message["text"]), reprompt=True)
             return
 
-        if message_type == "rename_ok":
-            self.username = str(message["username"])
-            print_line("[system]: ", f"username changed to {self.username}", reprompt=True)
-            return
-
         if message_type == "rename_error":
             print_line("[error]: ", str(message["text"]), reprompt=True)
             return
@@ -354,6 +380,7 @@ async def main_async() -> None:
         ssl_context,
         args.server_name or args.host,
         args.identity_dir,
+        args.client_cert,
     )
     await client.run()
 

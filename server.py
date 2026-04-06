@@ -6,7 +6,20 @@ import argparse
 import asyncio
 import ssl
 
-from identity import IdentityError, validate_public_identity
+from accounts import ACCOUNTS_FILE, AccountRegistry, AccountRegistryError
+from cert_utils import (
+    CertificateError,
+    build_client_certificate_pem,
+    load_ca_certificate,
+    load_ca_private_key,
+    validate_client_certificate,
+)
+from cryptography import x509
+from identity import (
+    IdentityError,
+    validate_public_identity,
+    verify_key_agreement_binding,
+)
 from protocol import DEFAULT_HOST, DEFAULT_PORT, ProtocolError, read_message, send_message
 from storage import SessionStore
 from tls_utils import build_server_ssl_context, parse_tls_version
@@ -31,6 +44,21 @@ def parse_args() -> argparse.Namespace:
         choices=("1.2", "1.3"),
         default="1.3",
         help="Minimum TLS version to allow. Defaults to 1.3.",
+    )
+    parser.add_argument(
+        "--ca-cert",
+        default="certs/ca-cert.pem",
+        help="Path to the CA certificate PEM file used to verify client identity certificates",
+    )
+    parser.add_argument(
+        "--ca-key",
+        default="certs/ca-key.pem",
+        help="Path to the CA private key PEM file used to issue client identity certificates",
+    )
+    parser.add_argument(
+        "--accounts-file",
+        default=f"data/{ACCOUNTS_FILE}",
+        help="Path to the persistent account registry JSON file",
     )
     return parser.parse_args()
 
@@ -70,17 +98,23 @@ async def safe_send(writer: asyncio.StreamWriter, message: dict[str, object]) ->
 
 
 async def handle_client(
-    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, store: SessionStore
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    store: SessionStore,
+    accounts: AccountRegistry,
+    ca_certificate: x509.Certificate,
+    ca_private_key: object,
 ) -> None:
     address = format_address(writer)
     log(f"connect {address} {format_tls_details(writer)}")
 
     try:
-        first_message = await read_message(reader, allowed_types={"register"})
+        first_message = await read_message(reader, allowed_types={"register", "login"})
         if first_message is None:
             log(f"disconnect {address} before registration")
             return
 
+        auth_mode = first_message["type"]
         username = first_message["username"].strip()
         try:
             public_identity = validate_public_identity(
@@ -109,6 +143,124 @@ async def handle_client(
             log(f"rejected registration from {address}: invalid username '{username}'")
             return
 
+        try:
+            verify_key_agreement_binding(
+                public_identity.signing_public_key,
+                username,
+                public_identity.key_agreement_public_key,
+                first_message["key_agreement_signature"],
+            )
+        except IdentityError as exc:
+            await safe_send(
+                writer,
+                {
+                    "type": "register_error",
+                    "text": f"Client identity error: {exc}",
+                },
+            )
+            log(f"rejected registration from {address}: invalid key binding ({exc})")
+            return
+
+        account = accounts.get(username)
+        created_account = False
+
+        if auth_mode == "register":
+            if account is not None and account.signing_public_key != public_identity.signing_public_key:
+                await safe_send(
+                    writer,
+                    {
+                        "type": "register_error",
+                        "text": f"Username '{username}' is already registered.",
+                    },
+                )
+                log(f"rejected registration from {address}: username already registered ('{username}')")
+                return
+
+            existing_identity = accounts.find_by_signing_key(public_identity.signing_public_key)
+            if existing_identity is not None and existing_identity.username != username:
+                await safe_send(
+                    writer,
+                    {
+                        "type": "register_error",
+                        "text": "This signing identity is already permanently bound to "
+                        f"username '{existing_identity.username}'.",
+                    },
+                )
+                log(
+                    "rejected registration from "
+                    f"{address}: signing identity already bound ('{existing_identity.username}')"
+                )
+                return
+
+            if account is None:
+                identity_certificate = build_client_certificate_pem(
+                    username,
+                    public_identity.signing_public_key,
+                    ca_certificate,
+                    ca_private_key,
+                )
+                try:
+                    account = accounts.create_account(
+                        username,
+                        public_identity,
+                        identity_certificate,
+                    )
+                except AccountRegistryError as exc:
+                    await safe_send(
+                        writer,
+                        {
+                            "type": "register_error",
+                            "text": f"Account registry error: {exc}",
+                        },
+                    )
+                    log(f"rejected registration from {address}: account registry error ({exc})")
+                    return
+                created_account = True
+        else:
+            if account is None:
+                await safe_send(
+                    writer,
+                    {
+                        "type": "register_error",
+                        "text": f"Username '{username}' is not registered.",
+                    },
+                )
+                log(f"rejected login from {address}: username not registered ('{username}')")
+                return
+
+            try:
+                validate_client_certificate(
+                    first_message["identity_certificate"],
+                    username,
+                    public_identity.signing_public_key,
+                    ca_certificate,
+                )
+            except CertificateError as exc:
+                await safe_send(
+                    writer,
+                    {
+                        "type": "register_error",
+                        "text": f"Client certificate error: {exc}",
+                    },
+                )
+                log(f"rejected login from {address}: certificate error ({exc})")
+                return
+
+            if not accounts.matches_identity(
+                username,
+                public_identity.signing_public_key,
+                first_message["identity_certificate"],
+            ):
+                await safe_send(
+                    writer,
+                    {
+                        "type": "register_error",
+                        "text": "Stored identity for this username does not match the presented certificate.",
+                    },
+                )
+                log(f"rejected login from {address}: stored identity mismatch ('{username}')")
+                return
+
         registered, error = store.register(username, writer, address, public_identity)
         if not registered:
             if error == "signing identity is already connected":
@@ -125,7 +277,20 @@ async def handle_client(
             log(f"rejected registration from {address}: {error} ('{username}')")
             return
 
-        await send_message(writer, {"type": "register_ok", "username": username})
+        assert account is not None
+        if account.key_agreement_public_key != public_identity.key_agreement_public_key:
+            account = accounts.update_key_agreement_key(
+                username,
+                public_identity.key_agreement_public_key,
+            )
+        await send_message(
+            writer,
+            {
+                "type": "register_ok",
+                "username": username,
+                "identity_certificate": account.identity_certificate,
+            },
+        )
         await send_message(
             writer,
             {
@@ -134,7 +299,8 @@ async def handle_client(
             },
         )
         log(
-            "registered "
+            ("registered " if created_account else "authenticated ")
+            + 
             f"{username} from {address} "
             f"(sign={public_identity.signing_fingerprint[:16]}, "
             f"x25519={public_identity.key_agreement_fingerprint[:16]})"
@@ -202,33 +368,13 @@ async def handle_client(
                 continue
 
             if message_type == "rename":
-                new_username = message["new_username"].strip()
-                if not is_valid_username(new_username):
-                    await send_message(
-                        writer,
-                        {
-                            "type": "rename_error",
-                            "text": "Username must be 1-32 characters and contain no spaces.",
-                        },
-                    )
-                    continue
-
-                old_username = session.username
-                if new_username == old_username:
-                    await send_message(writer, {"type": "rename_ok", "username": new_username})
-                    continue
-
-                renamed, error = store.rename(writer, new_username)
-                if not renamed:
-                    await send_message(
-                        writer,
-                        {"type": "rename_error", "text": error or "Rename failed."},
-                    )
-                    log(f"rename rejected for {old_username}: {error}")
-                    continue
-
-                await send_message(writer, {"type": "rename_ok", "username": new_username})
-                log(f"rename {old_username} -> {new_username}")
+                await send_message(
+                    writer,
+                    {
+                        "type": "rename_error",
+                        "text": "Usernames are bound to CA-signed certificates and cannot be changed.",
+                    },
+                )
                 continue
 
             if message_type == "disconnect":
@@ -280,10 +426,24 @@ async def shutdown_clients(store: SessionStore) -> None:
             pass
 
 
-async def run_server(host: str, port: int, ssl_context: ssl.SSLContext) -> None:
+async def run_server(
+    host: str,
+    port: int,
+    ssl_context: ssl.SSLContext,
+    accounts: AccountRegistry,
+    ca_certificate: x509.Certificate,
+    ca_private_key: object,
+) -> None:
     store = SessionStore()
     server = await asyncio.start_server(
-        lambda reader, writer: handle_client(reader, writer, store),
+        lambda reader, writer: handle_client(
+            reader,
+            writer,
+            store,
+            accounts,
+            ca_certificate,
+            ca_private_key,
+        ),
         host,
         port,
         ssl=ssl_context,
@@ -312,10 +472,22 @@ def main() -> None:
             args.keyfile,
             minimum_version=parse_tls_version(args.tls_min_version),
         )
-        asyncio.run(run_server(args.host, args.port, ssl_context))
+        ca_certificate = load_ca_certificate(args.ca_cert)
+        ca_private_key = load_ca_private_key(args.ca_key)
+        accounts = AccountRegistry(args.accounts_file)
+        asyncio.run(
+            run_server(
+                args.host,
+                args.port,
+                ssl_context,
+                accounts,
+                ca_certificate,
+                ca_private_key,
+            )
+        )
     except KeyboardInterrupt:
         log("stopped by keyboard interrupt")
-    except (OSError, ssl.SSLError) as exc:
+    except (AccountRegistryError, CertificateError, OSError, ssl.SSLError) as exc:
         log(f"TLS setup error: {exc}")
 
 

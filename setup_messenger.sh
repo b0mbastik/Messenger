@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-cert_dir="${1:-certs}"
+cert_dir="certs"
 
 mkdir -p "$cert_dir"
 
@@ -37,4 +37,4 @@ openssl x509 -req -days 365 \
   -out "$cert_dir/server-cert.pem" \
   -extfile "$server_ext"
 
-printf 'Wrote development certificates to %s\n' "$cert_dir"
+printf 'Wrote CA and server certificates to %s\n' "$cert_dir"
