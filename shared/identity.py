@@ -19,10 +19,11 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PublicKey,
 )
 from cryptography.exceptions import InvalidSignature
+from shared.paths import DEFAULT_IDENTITIES_ROOT
 
 IDENTITY_FILE = "identity.json"
 IDENTITY_CERT_FILE = "identity-cert.pem"
-DEFAULT_IDENTITIES_DIR = "identities"
+DEFAULT_IDENTITIES_DIR = str(DEFAULT_IDENTITIES_ROOT)
 KEY_AGREEMENT_BINDING_CONTEXT = b"messenger-key-agreement:v1"
 
 

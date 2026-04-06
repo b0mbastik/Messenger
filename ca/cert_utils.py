@@ -12,7 +12,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, ed25519, ed448, rsa
 from cryptography.hazmat.primitives.asymmetric.padding import PKCS1v15
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
-from identity import decode_key_bytes
+from shared.identity import decode_key_bytes
 
 
 class CertificateError(Exception):

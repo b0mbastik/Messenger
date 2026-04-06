@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from identity import PublicIdentity
+from shared.identity import PublicIdentity
 
 
 @dataclass(slots=True)

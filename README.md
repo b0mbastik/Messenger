@@ -8,17 +8,13 @@ The transport is protected with TLS and server certificate verification. Each cl
 
 On first registration the server checks that the username is free, issues a certificate for the user's Ed25519 identity key, and stores the permanent binding. On later logins the client presents that stored certificate and the server verifies the binding before allowing the session.
 
-## Files
+## Layout
 
-- `server.py`: asyncio TCP server that accepts clients, registers users, and routes messages
-- `client.py`: terminal client with interactive commands
-- `protocol.py`: newline-delimited JSON framing and protocol validation
-- `storage.py`: in-memory connected-session store
-- `accounts.py`: persistent account registry for long-term username bindings
-- `identity.py`: long-term Ed25519/X25519 identity key management
-- `cert_utils.py`: CA-backed X.509 certificate issuance and verification helpers
-- `tls_utils.py`: TLS context configuration helpers
-- `setup_messenger.sh`: one-step setup script for the CA and server certificate
+- `client/`: interactive client entrypoint and local client identity storage
+- `server/`: server entrypoint, account registry, and server-side runtime data
+- `ca/`: certificate and TLS helpers, setup script, and generated CA/server certs
+- `shared/`: shared protocol and identity code used by both sides
+- `tests/`: automated test suite
 - `requirements.txt`: dependency file for the project
 
 ## Requirements
@@ -38,20 +34,20 @@ python3 -m pip install -r requirements.txt
 Run the setup script once:
 
 ```bash
-./setup_messenger.sh
+./ca/setup.sh
 ```
 
 It creates:
 
-- `certs/ca-cert.pem` and `certs/ca-key.pem`
-- `certs/server-cert.pem` and `certs/server-key.pem`
+- `ca/certs/ca-cert.pem` and `ca/certs/ca-key.pem`
+- `ca/certs/server-cert.pem` and `ca/certs/server-key.pem`
 
 If you want to generate them manually, use these exact commands.
 
 Create an OpenSSL extension file for the server certificate:
 
 ```bash
-cat > certs/server-ext.cnf <<'EOF'
+cat > ca/certs/server-ext.cnf <<'EOF'
 basicConstraints=critical,CA:false
 keyUsage=critical,digitalSignature,keyEncipherment
 subjectAltName=DNS:localhost,IP:127.0.0.1
@@ -65,8 +61,8 @@ Create a local CA certificate with explicit CA extensions:
 
 ```bash
 openssl req -x509 -new -nodes -days 365 -newkey rsa:2048 \
-  -keyout certs/ca-key.pem \
-  -out certs/ca-cert.pem \
+  -keyout ca/certs/ca-key.pem \
+  -out ca/certs/ca-cert.pem \
   -subj "/CN=Messenger Local CA" \
   -addext "basicConstraints=critical,CA:true" \
   -addext "keyUsage=critical,keyCertSign,cRLSign"
@@ -76,8 +72,8 @@ Create a server key and certificate signing request:
 
 ```bash
 openssl req -new -nodes -newkey rsa:2048 \
-  -keyout certs/server-key.pem \
-  -out certs/server.csr \
+  -keyout ca/certs/server-key.pem \
+  -out ca/certs/server.csr \
   -subj "/CN=localhost"
 ```
 
@@ -85,15 +81,15 @@ Sign the server certificate with the local CA:
 
 ```bash
 openssl x509 -req -days 365 \
-  -in certs/server.csr \
-  -CA certs/ca-cert.pem \
-  -CAkey certs/ca-key.pem \
+  -in ca/certs/server.csr \
+  -CA ca/certs/ca-cert.pem \
+  -CAkey ca/certs/ca-key.pem \
   -CAcreateserial \
-  -out certs/server-cert.pem \
-  -extfile certs/server-ext.cnf
+  -out ca/certs/server-cert.pem \
+  -extfile ca/certs/server-ext.cnf
 ```
 
-If you previously generated certificates using older instructions, delete the old files in `certs/` and regenerate them. An older CA without the proper extensions can trigger:
+If you previously generated certificates using older instructions, delete the old files in `ca/certs/` and regenerate them. An older CA without the proper extensions can trigger:
 
 ```text
 [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: CA cert does not include key usage extension
@@ -104,35 +100,35 @@ If you previously generated certificates using older instructions, delete the ol
 Start the TLS server:
 
 ```bash
-python3 server.py
+python3 -m server
 ```
 
 Optional arguments:
 
 ```bash
-python3 server.py --host 127.0.0.1 --port 8888 \
-  --certfile certs/server-cert.pem \
-  --keyfile certs/server-key.pem \
-  --ca-cert certs/ca-cert.pem \
-  --ca-key certs/ca-key.pem \
-  --accounts-file data/accounts.json \
+python3 -m server --host 127.0.0.1 --port 8888 \
+  --certfile ca/certs/server-cert.pem \
+  --keyfile ca/certs/server-key.pem \
+  --ca-cert ca/certs/ca-cert.pem \
+  --ca-key ca/certs/ca-key.pem \
+  --accounts-file server/data/accounts.json \
   --tls-min-version 1.3
 ```
 
 Start one or more clients in separate terminals:
 
 ```bash
-python3 client.py
+python3 -m client
 ```
 
 Optional arguments:
 
 ```bash
-python3 client.py --host 127.0.0.1 --port 8888 \
-  --ca-cert certs/ca-cert.pem \
+python3 -m client --host 127.0.0.1 --port 8888 \
+  --ca-cert ca/certs/ca-cert.pem \
   --server-name localhost \
   --tls-min-version 1.3 \
-  --identity-dir identities/alice
+  --identity-dir client/identities/alice
 ```
 
 Default connection settings:
@@ -140,8 +136,8 @@ Default connection settings:
 - Host: `127.0.0.1`
 - Port: `8888`
 - Minimum TLS version: `1.3`
-- Default identity directory: `identities/<username>`
-- Default account registry: `data/accounts.json`
+- Default identity directory: `client/identities/<username>`
+- Default account registry: `server/data/accounts.json`
 
 ## Registration and Login
 
@@ -150,7 +146,7 @@ Each client profile stores two long-term private keys locally:
 - Ed25519 as the certified long-term signing and identity key
 - X25519 as the long-term key-agreement key
 
-The client stores them in `identity.json` inside the selected identity directory. By default, if you do not pass `--identity-dir`, the client uses `identities/<username>` after you enter the username.
+The client stores them in `identity.json` inside the selected identity directory. By default, if you do not pass `--identity-dir`, the client uses `client/identities/<username>` after you enter the username.
 
 On first use for a new username:
 
@@ -169,7 +165,7 @@ On later logins:
 - the server verifies that the Ed25519 key matches the certificate
 - the server verifies that the Ed25519 key signs the current X25519 key
 
-The server stores the permanent username binding in `data/accounts.json`, so usernames remain bound to the same Ed25519 identity across server restarts.
+The server stores the permanent username binding in `server/data/accounts.json`, so usernames remain bound to the same Ed25519 identity across server restarts.
 
 Because the username is part of the long-term identity:
 
@@ -180,8 +176,8 @@ Because the username is part of the long-term identity:
 If you want multiple local clients on the same machine, give each one a different identity directory, for example:
 
 ```bash
-python3 client.py --identity-dir client-identities/alice
-python3 client.py --identity-dir client-identities/bob
+python3 -m client --identity-dir client-identities/alice
+python3 -m client --identity-dir client-identities/bob
 ```
 
 ## Client Commands
@@ -193,8 +189,8 @@ python3 client.py --identity-dir client-identities/bob
 
 ## Example Session
 
-1. Start `server.py`.
-2. Open two terminals and run `client.py` in each.
+1. Start `python3 -m server`.
+2. Open two terminals and run `python3 -m client` in each.
 3. On first use, register usernames such as `alice` and `bob`.
 4. From Alice's client, run:
 
@@ -233,5 +229,5 @@ This layout is designed to be extended later with:
 Run the automated tests with:
 
 ```bash
-python3 -m unittest -v test_messenger.py
+python3 -m unittest -v tests.test_messenger
 ```

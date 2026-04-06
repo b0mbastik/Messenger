@@ -7,12 +7,12 @@ env/
 
 .DS_Store
 
-certs/*.pem
-certs/*.csr
-certs/*.cnf
-certs/*.srl
+ca/certs/*.pem
+ca/certs/*.csr
+ca/certs/*.cnf
+ca/certs/*.srl
 
-.identity/
-identities/
+client/.identity/
+client/identities/
 client-identities/
-data/
+server/data/

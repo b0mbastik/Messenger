@@ -6,23 +6,31 @@ import argparse
 import asyncio
 import ssl
 
-from accounts import ACCOUNTS_FILE, AccountRegistry, AccountRegistryError
-from cert_utils import (
+from ca.cert_utils import (
     CertificateError,
     build_client_certificate_pem,
     load_ca_certificate,
     load_ca_private_key,
     validate_client_certificate,
 )
+from ca.tls_utils import build_server_ssl_context, parse_tls_version
 from cryptography import x509
-from identity import (
+from server.accounts import AccountRegistry, AccountRegistryError
+from server.storage import SessionStore
+from shared.identity import (
     IdentityError,
     validate_public_identity,
     verify_key_agreement_binding,
 )
-from protocol import DEFAULT_HOST, DEFAULT_PORT, ProtocolError, read_message, send_message
-from storage import SessionStore
-from tls_utils import build_server_ssl_context, parse_tls_version
+from shared.paths import (
+    DEFAULT_ACCOUNTS_FILE,
+    DEFAULT_CA_CERT_PATH,
+    DEFAULT_CA_KEY_PATH,
+    DEFAULT_SERVER_CERT_PATH,
+    DEFAULT_SERVER_KEY_PATH,
+    resolve_project_path,
+)
+from shared.protocol import DEFAULT_HOST, DEFAULT_PORT, ProtocolError, read_message, send_message
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,12 +39,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port to bind to")
     parser.add_argument(
         "--certfile",
-        default="certs/server-cert.pem",
+        default=str(DEFAULT_SERVER_CERT_PATH),
         help="Path to the TLS server certificate PEM file",
     )
     parser.add_argument(
         "--keyfile",
-        default="certs/server-key.pem",
+        default=str(DEFAULT_SERVER_KEY_PATH),
         help="Path to the TLS server private key PEM file",
     )
     parser.add_argument(
@@ -47,17 +55,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--ca-cert",
-        default="certs/ca-cert.pem",
+        default=str(DEFAULT_CA_CERT_PATH),
         help="Path to the CA certificate PEM file used to verify client identity certificates",
     )
     parser.add_argument(
         "--ca-key",
-        default="certs/ca-key.pem",
+        default=str(DEFAULT_CA_KEY_PATH),
         help="Path to the CA private key PEM file used to issue client identity certificates",
     )
     parser.add_argument(
         "--accounts-file",
-        default=f"data/{ACCOUNTS_FILE}",
+        default=str(DEFAULT_ACCOUNTS_FILE),
         help="Path to the persistent account registry JSON file",
     )
     return parser.parse_args()
@@ -468,13 +476,13 @@ def main() -> None:
     args = parse_args()
     try:
         ssl_context = build_server_ssl_context(
-            args.certfile,
-            args.keyfile,
+            str(resolve_project_path(args.certfile)),
+            str(resolve_project_path(args.keyfile)),
             minimum_version=parse_tls_version(args.tls_min_version),
         )
-        ca_certificate = load_ca_certificate(args.ca_cert)
-        ca_private_key = load_ca_private_key(args.ca_key)
-        accounts = AccountRegistry(args.accounts_file)
+        ca_certificate = load_ca_certificate(resolve_project_path(args.ca_cert))
+        ca_private_key = load_ca_private_key(resolve_project_path(args.ca_key))
+        accounts = AccountRegistry(resolve_project_path(args.accounts_file))
         asyncio.run(
             run_server(
                 args.host,

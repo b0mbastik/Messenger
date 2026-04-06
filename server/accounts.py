@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from identity import PublicIdentity
+from shared.identity import PublicIdentity
 
 
 ACCOUNTS_FILE = "accounts.json"

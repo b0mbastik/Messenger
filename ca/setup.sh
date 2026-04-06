@@ -2,7 +2,8 @@
 
 set -euo pipefail
 
-cert_dir="certs"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cert_dir="$script_dir/certs"
 
 mkdir -p "$cert_dir"
 

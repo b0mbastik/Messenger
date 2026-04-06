@@ -12,9 +12,12 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from accounts import AccountRegistry
-from cert_utils import load_ca_certificate, load_ca_private_key
-from identity import (
+from ca.cert_utils import load_ca_certificate, load_ca_private_key
+from ca.tls_utils import build_client_ssl_context, build_server_ssl_context, parse_tls_version
+from server.accounts import AccountRegistry
+from server.app import handle_client, shutdown_clients
+from server.storage import SessionStore
+from shared.identity import (
     DEFAULT_IDENTITIES_DIR,
     IdentityError,
     default_certificate_path,
@@ -23,10 +26,7 @@ from identity import (
     load_or_create_identity,
     validate_public_identity,
 )
-from protocol import ProtocolError, read_message, send_message, validate_message
-from server import handle_client, shutdown_clients
-from storage import SessionStore
-from tls_utils import build_client_ssl_context, build_server_ssl_context, parse_tls_version
+from shared.protocol import ProtocolError, read_message, send_message, validate_message
 
 
 class TestPeer:

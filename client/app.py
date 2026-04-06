@@ -8,15 +8,16 @@ from pathlib import Path
 import ssl
 import sys
 
-from identity import (
+from ca.tls_utils import build_client_ssl_context, parse_tls_version
+from shared.identity import (
     ClientIdentity,
     default_certificate_path,
-    IdentityError,
     default_identity_dir_for_username,
+    IdentityError,
     load_or_create_identity,
 )
-from protocol import DEFAULT_HOST, DEFAULT_PORT, ProtocolError, read_message, send_message
-from tls_utils import build_client_ssl_context, parse_tls_version
+from shared.paths import DEFAULT_CA_CERT_PATH, resolve_project_path
+from shared.protocol import DEFAULT_HOST, DEFAULT_PORT, ProtocolError, read_message, send_message
 
 
 HELP_TEXT = """Available commands:
@@ -32,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Server port")
     parser.add_argument(
         "--ca-cert",
-        default="certs/ca-cert.pem",
+        default=str(DEFAULT_CA_CERT_PATH),
         help="Path to the CA certificate PEM file used to verify the server",
     )
     parser.add_argument(
@@ -227,12 +228,12 @@ class MessengerClient:
 
     def resolve_identity_dir(self, username: str) -> Path:
         if self.identity_dir:
-            return Path(self.identity_dir)
-        return default_identity_dir_for_username(username)
+            return resolve_project_path(self.identity_dir)
+        return resolve_project_path(default_identity_dir_for_username(username))
 
     def resolve_certificate_path(self, identity: ClientIdentity) -> Path:
         if self.client_cert:
-            return Path(self.client_cert)
+            return resolve_project_path(self.client_cert)
         return default_certificate_path(identity.path.parent)
 
     def load_identity_certificate(self, identity: ClientIdentity) -> str | None:
@@ -371,7 +372,7 @@ class MessengerClient:
 async def main_async() -> None:
     args = parse_args()
     ssl_context = build_client_ssl_context(
-        args.ca_cert,
+        str(resolve_project_path(args.ca_cert)),
         minimum_version=parse_tls_version(args.tls_min_version),
     )
     client = MessengerClient(
