@@ -17,6 +17,13 @@ from ca.tls_utils import build_client_ssl_context, build_server_ssl_context, par
 from server.accounts import AccountRegistry
 from server.app import handle_client, shutdown_clients
 from server.storage import SessionStore
+from shared.e2ee import (
+    MessageCryptoError,
+    RecipientBundle,
+    decrypt_message_from_sender,
+    encrypt_message_for_recipient,
+    validate_recipient_bundle,
+)
 from shared.identity import (
     DEFAULT_IDENTITIES_DIR,
     IdentityError,
@@ -38,6 +45,7 @@ class TestPeer:
         port: int,
         ssl_context: ssl.SSLContext,
         server_name: str,
+        ca_certificate: object,
         username: str,
         identity_dir: Path,
     ) -> None:
@@ -45,6 +53,7 @@ class TestPeer:
         self.port = port
         self.ssl_context = ssl_context
         self.server_name = server_name
+        self.ca_certificate = ca_certificate
         self.username = username
         self.identity = load_or_create_identity(identity_dir)
         self.signing_public_key = self.identity.public_identity.signing_public_key
@@ -123,6 +132,47 @@ class TestPeer:
     async def recv(self, timeout: float = 1.0) -> dict[str, object] | None:
         assert self.reader is not None
         return await asyncio.wait_for(read_message(self.reader), timeout=timeout)
+
+    async def lookup_user(self, username: str) -> dict[str, object] | None:
+        await self.send({"type": "lookup_user", "username": username})
+        return await self.recv()
+
+    async def send_encrypted_message(self, recipient: str, plaintext: str) -> None:
+        response = await self.lookup_user(recipient)
+        if response is None or response["type"] != "user_bundle":
+            raise AssertionError(f"expected recipient bundle for {recipient}, got {response!r}")
+
+        bundle = validate_recipient_bundle(
+            RecipientBundle(
+                username=str(response["username"]),
+                signing_public_key=str(response["signing_public_key"]),
+                key_agreement_public_key=str(response["key_agreement_public_key"]),
+                key_agreement_signature=str(response["key_agreement_signature"]),
+                identity_certificate=str(response["identity_certificate"]),
+            ),
+            self.ca_certificate,
+        )
+        envelope = encrypt_message_for_recipient(
+            self.identity,
+            self.username,
+            bundle,
+            plaintext,
+        )
+        await self.send({"type": "direct_message", "to": recipient, **envelope})
+
+    def decrypt_incoming_message(self, message: dict[str, object]) -> str:
+        return decrypt_message_from_sender(
+            self.identity,
+            self.username,
+            str(message["from"]),
+            str(message["signing_public_key"]),
+            str(message["identity_certificate"]),
+            str(message["sender_ephemeral_public_key"]),
+            str(message["nonce"]),
+            str(message["ciphertext"]),
+            str(message["signature"]),
+            self.ca_certificate,
+        )
 
     async def disconnect(self) -> None:
         if self.writer is None or self.writer.is_closing():
@@ -323,6 +373,7 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
             self.port,
             self.client_ssl_context,
             "localhost",
+            self.ca_certificate,
             username,
             identity_path,
         )
@@ -455,18 +506,28 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
         await alice.authenticate()
         await bob.authenticate()
 
-        await alice.send({"type": "direct_message", "to": "bob", "text": "hello"})
+        await alice.send_encrypted_message("bob", "hello")
         incoming = await bob.recv()
-        self.assertEqual(
-            incoming,
-            {"type": "incoming_message", "from": "alice", "text": "hello"},
-        )
+        self.assertIsNotNone(incoming)
+        assert incoming is not None
+        self.assertEqual(incoming["type"], "incoming_message")
+        self.assertEqual(incoming["from"], "alice")
+        self.assertEqual(bob.decrypt_incoming_message(incoming), "hello")
 
     async def test_direct_message_to_missing_user_returns_delivery_error(self) -> None:
         alice = await self.make_peer("alice")
         await alice.authenticate()
 
-        await alice.send({"type": "direct_message", "to": "nobody", "text": "hello"})
+        await alice.send(
+            {
+                "type": "direct_message",
+                "to": "nobody",
+                "sender_ephemeral_public_key": alice.key_agreement_public_key,
+                "nonce": "AAAAAAAAAAAAAAAA",
+                "ciphertext": "AQ==",
+                "signature": "AQ==",
+            }
+        )
         response = await alice.recv()
         self.assertEqual(
             response,
@@ -475,6 +536,36 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
                 "text": "User 'nobody' is not connected.",
             },
         )
+
+    async def test_lookup_user_returns_certified_key_bundle(self) -> None:
+        alice = await self.make_peer("alice")
+        bob = await self.make_peer("bob")
+        await alice.authenticate()
+        await bob.authenticate()
+
+        response = await alice.lookup_user("bob")
+        self.assertIsNotNone(response)
+        assert response is not None
+        self.assertEqual(response["type"], "user_bundle")
+        self.assertEqual(response["username"], "bob")
+        self.assertEqual(response["signing_public_key"], bob.signing_public_key)
+        self.assertEqual(response["key_agreement_public_key"], bob.key_agreement_public_key)
+
+    async def test_tampered_incoming_message_fails_signature_verification(self) -> None:
+        alice = await self.make_peer("alice")
+        bob = await self.make_peer("bob")
+        await alice.authenticate()
+        await bob.authenticate()
+
+        await alice.send_encrypted_message("bob", "hello")
+        incoming = await bob.recv()
+        self.assertIsNotNone(incoming)
+        assert incoming is not None
+        tampered = dict(incoming)
+        tampered["ciphertext"] = "Ag=="
+
+        with self.assertRaises(MessageCryptoError):
+            bob.decrypt_incoming_message(tampered)
 
     async def test_rename_is_rejected(self) -> None:
         alice = await self.make_peer("alice")
@@ -652,7 +743,16 @@ class ProtocolValidationTests(unittest.TestCase):
 
     def test_validate_message_rejects_empty_required_field(self) -> None:
         with self.assertRaises(ProtocolError):
-            validate_message({"type": "direct_message", "to": "bob", "text": "   "})
+            validate_message(
+                {
+                    "type": "direct_message",
+                    "to": "bob",
+                    "sender_ephemeral_public_key": "abc",
+                    "nonce": "def",
+                    "ciphertext": "   ",
+                    "signature": "ghi",
+                }
+            )
 
     def test_validate_message_rejects_invalid_users_list(self) -> None:
         with self.assertRaises(ProtocolError):
@@ -677,6 +777,10 @@ class ProtocolValidationTests(unittest.TestCase):
     def test_validate_message_requires_certificate_in_register_ok(self) -> None:
         with self.assertRaises(ProtocolError):
             validate_message({"type": "register_ok", "username": "alice"})
+
+    def test_validate_message_requires_bundle_fields_in_user_bundle(self) -> None:
+        with self.assertRaises(ProtocolError):
+            validate_message({"type": "user_bundle", "username": "alice"})
 
 
 class TlsConfigurationTests(unittest.TestCase):

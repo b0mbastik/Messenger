@@ -8,7 +8,16 @@ from pathlib import Path
 import ssl
 import sys
 
+from cryptography import x509
+from ca.cert_utils import CertificateError, load_ca_certificate
 from ca.tls_utils import build_client_ssl_context, parse_tls_version
+from shared.e2ee import (
+    MessageCryptoError,
+    RecipientBundle,
+    decrypt_message_from_sender,
+    encrypt_message_for_recipient,
+    validate_recipient_bundle,
+)
 from shared.identity import (
     ClientIdentity,
     default_certificate_path,
@@ -114,6 +123,7 @@ class MessengerClient:
         port: int,
         ssl_context: ssl.SSLContext,
         server_name: str,
+        ca_certificate: x509.Certificate,
         identity_dir: str | None,
         client_cert: str | None,
     ) -> None:
@@ -121,6 +131,7 @@ class MessengerClient:
         self.port = port
         self.ssl_context = ssl_context
         self.server_name = server_name
+        self.ca_certificate = ca_certificate
         self.identity_dir = identity_dir
         self.client_cert = client_cert
         self.identity: ClientIdentity | None = None
@@ -128,6 +139,7 @@ class MessengerClient:
         self.stop_event = asyncio.Event()
         self.reader: asyncio.StreamReader | None = None
         self.writer: asyncio.StreamWriter | None = None
+        self.pending_user_bundle_requests: dict[str, asyncio.Future[RecipientBundle]] = {}
 
     async def run(self) -> None:
         print("TLS Messenger")
@@ -276,11 +288,7 @@ class MessengerClient:
 
                 target = parts[1].strip()
                 text = parts[2].strip()
-                await send_message(
-                    self.writer,
-                    {"type": "direct_message", "to": target, "text": text},
-                )
-                print_line(f"[to {target}]: ", text)
+                await self.send_direct_message(target, text)
                 continue
 
             if command.startswith("/name "):
@@ -303,15 +311,18 @@ class MessengerClient:
             while not self.stop_event.is_set():
                 message = await read_message(self.reader)
                 if message is None:
+                    self._fail_pending_requests(ConnectionError("server disconnected"))
                     print_line("[system]: ", "server disconnected")
                     self.stop_event.set()
                     return
 
                 self.handle_server_message(message)
         except ProtocolError as exc:
+            self._fail_pending_requests(exc)
             print_line("[error]: ", f"protocol error: {exc}")
             self.stop_event.set()
         except (ConnectionError, OSError) as exc:
+            self._fail_pending_requests(exc)
             print_line("[error]: ", f"connection error: {exc}")
             self.stop_event.set()
 
@@ -319,16 +330,20 @@ class MessengerClient:
         message_type = message["type"]
 
         if message_type == "incoming_message":
-            print_line(
-                f"[from {message['from']}]: ",
-                str(message["text"]),
-                reprompt=not self.stop_event.is_set(),
-            )
+            self.handle_incoming_message(message)
             return
 
         if message_type == "users_list":
             users = ", ".join(message["users"]) if message["users"] else "(none)"
             print_line("[system]: ", f"connected users: {users}", reprompt=True)
+            return
+
+        if message_type == "user_bundle":
+            self.handle_user_bundle(message)
+            return
+
+        if message_type == "user_bundle_error":
+            self.handle_user_bundle_error(message)
             return
 
         if message_type == "delivery_error":
@@ -344,6 +359,125 @@ class MessengerClient:
             return
 
         print_line("[system]: ", f"received unexpected message: {message}", reprompt=True)
+
+    async def send_direct_message(self, target: str, text: str) -> None:
+        assert self.writer is not None
+        assert self.identity is not None
+        assert self.username is not None
+
+        try:
+            recipient_bundle = await self.fetch_user_bundle(target)
+            envelope = encrypt_message_for_recipient(
+                self.identity,
+                self.username,
+                recipient_bundle,
+                text,
+            )
+        except MessageCryptoError as exc:
+            print_line("[error]: ", str(exc), reprompt=True)
+            return
+        except (ConnectionError, OSError) as exc:
+            print_line("[error]: ", f"connection error: {exc}", reprompt=True)
+            self.stop_event.set()
+            return
+
+        await send_message(
+            self.writer,
+            {
+                "type": "direct_message",
+                "to": target,
+                **envelope,
+            },
+        )
+        print_line(f"[to {target}]: ", text)
+
+    async def fetch_user_bundle(self, username: str) -> RecipientBundle:
+        assert self.writer is not None
+
+        existing = self.pending_user_bundle_requests.get(username)
+        if existing is not None:
+            return await existing
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[RecipientBundle] = loop.create_future()
+        self.pending_user_bundle_requests[username] = future
+        try:
+            await send_message(self.writer, {"type": "lookup_user", "username": username})
+            return await future
+        finally:
+            current = self.pending_user_bundle_requests.get(username)
+            if current is future:
+                self.pending_user_bundle_requests.pop(username, None)
+
+    def handle_incoming_message(self, message: dict[str, object]) -> None:
+        assert self.identity is not None
+        assert self.username is not None
+
+        sender_username = str(message["from"])
+        try:
+            plaintext = decrypt_message_from_sender(
+                self.identity,
+                self.username,
+                sender_username,
+                str(message["signing_public_key"]),
+                str(message["identity_certificate"]),
+                str(message["sender_ephemeral_public_key"]),
+                str(message["nonce"]),
+                str(message["ciphertext"]),
+                str(message["signature"]),
+                self.ca_certificate,
+            )
+        except MessageCryptoError as exc:
+            print_line(
+                "[error]: ",
+                f"could not verify/decrypt message from {sender_username}: {exc}",
+                reprompt=not self.stop_event.is_set(),
+            )
+            return
+
+        print_line(
+            f"[from {sender_username}]: ",
+            plaintext,
+            reprompt=not self.stop_event.is_set(),
+        )
+
+    def handle_user_bundle(self, message: dict[str, object]) -> None:
+        username = str(message["username"])
+        future = self.pending_user_bundle_requests.get(username)
+        if future is None or future.done():
+            print_line("[system]: ", f"received unexpected message: {message}", reprompt=True)
+            return
+
+        try:
+            future.set_result(
+                validate_recipient_bundle(
+                    RecipientBundle(
+                        username=username,
+                        signing_public_key=str(message["signing_public_key"]),
+                        key_agreement_public_key=str(message["key_agreement_public_key"]),
+                        key_agreement_signature=str(message["key_agreement_signature"]),
+                        identity_certificate=str(message["identity_certificate"]),
+                    ),
+                    self.ca_certificate,
+                )
+            )
+        except MessageCryptoError as exc:
+            future.set_exception(exc)
+
+    def handle_user_bundle_error(self, message: dict[str, object]) -> None:
+        username = str(message["username"])
+        future = self.pending_user_bundle_requests.get(username)
+        if future is None or future.done():
+            print_line("[error]: ", str(message["text"]), reprompt=True)
+            return
+
+        future.set_exception(MessageCryptoError(str(message["text"])))
+
+    def _fail_pending_requests(self, exc: Exception) -> None:
+        for future in self.pending_user_bundle_requests.values():
+            if not future.done():
+                future.set_exception(exc)
+        self.pending_user_bundle_requests.clear()
 
     async def send_disconnect(self) -> None:
         if self.stop_event.is_set():
@@ -371,6 +505,7 @@ class MessengerClient:
 
 async def main_async() -> None:
     args = parse_args()
+    ca_certificate = load_ca_certificate(resolve_project_path(args.ca_cert))
     ssl_context = build_client_ssl_context(
         str(resolve_project_path(args.ca_cert)),
         minimum_version=parse_tls_version(args.tls_min_version),
@@ -380,6 +515,7 @@ async def main_async() -> None:
         args.port,
         ssl_context,
         args.server_name or args.host,
+        ca_certificate,
         args.identity_dir,
         args.client_cert,
     )
@@ -395,6 +531,8 @@ def main() -> None:
         print_line("[error]: ", "could not connect to the server")
     except ssl.SSLError as exc:
         print_line("[error]: ", f"TLS error: {exc}")
+    except CertificateError as exc:
+        print_line("[error]: ", f"certificate error: {exc}")
     except IdentityError as exc:
         print_line("[error]: ", f"identity error: {exc}")
     except OSError as exc:

@@ -269,7 +269,20 @@ async def handle_client(
                 log(f"rejected login from {address}: stored identity mismatch ('{username}')")
                 return
 
-        registered, error = store.register(username, writer, address, public_identity)
+        assert account is not None
+        if account.key_agreement_public_key != public_identity.key_agreement_public_key:
+            account = accounts.update_key_agreement_key(
+                username,
+                public_identity.key_agreement_public_key,
+            )
+        registered, error = store.register(
+            username,
+            writer,
+            address,
+            public_identity,
+            first_message["key_agreement_signature"],
+            account.identity_certificate,
+        )
         if not registered:
             if error == "signing identity is already connected":
                 text = "This long-term signing identity is already connected as another user."
@@ -284,13 +297,6 @@ async def handle_client(
             )
             log(f"rejected registration from {address}: {error} ('{username}')")
             return
-
-        assert account is not None
-        if account.key_agreement_public_key != public_identity.key_agreement_public_key:
-            account = accounts.update_key_agreement_key(
-                username,
-                public_identity.key_agreement_public_key,
-            )
         await send_message(
             writer,
             {
@@ -331,9 +337,35 @@ async def handle_client(
                 )
                 continue
 
+            if message_type == "lookup_user":
+                recipient_name = message["username"]
+                recipient = store.get_by_username(recipient_name)
+                if recipient is None:
+                    await send_message(
+                        writer,
+                        {
+                            "type": "user_bundle_error",
+                            "username": recipient_name,
+                            "text": f"User '{recipient_name}' is not connected.",
+                        },
+                    )
+                    continue
+
+                await send_message(
+                    writer,
+                    {
+                        "type": "user_bundle",
+                        "username": recipient.username,
+                        "signing_public_key": recipient.public_identity.signing_public_key,
+                        "key_agreement_public_key": recipient.public_identity.key_agreement_public_key,
+                        "key_agreement_signature": recipient.key_agreement_signature,
+                        "identity_certificate": recipient.identity_certificate,
+                    },
+                )
+                continue
+
             if message_type == "direct_message":
                 recipient_name = message["to"]
-                text = message["text"]
                 recipient = store.get_by_username(recipient_name)
 
                 if recipient is None:
@@ -352,7 +384,12 @@ async def handle_client(
                     {
                         "type": "incoming_message",
                         "from": session.username,
-                        "text": text,
+                        "signing_public_key": session.public_identity.signing_public_key,
+                        "identity_certificate": session.identity_certificate,
+                        "sender_ephemeral_public_key": message["sender_ephemeral_public_key"],
+                        "nonce": message["nonce"],
+                        "ciphertext": message["ciphertext"],
+                        "signature": message["signature"],
                     },
                 )
                 if not delivered:
@@ -372,7 +409,11 @@ async def handle_client(
                     )
                     continue
 
-                log(f"message {session.username} -> {recipient_name}: {text!r}")
+                log(
+                    "message "
+                    f"{session.username} -> {recipient_name}: "
+                    f"{len(str(message['ciphertext']))} base64 bytes"
+                )
                 continue
 
             if message_type == "rename":

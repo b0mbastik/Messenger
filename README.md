@@ -1,12 +1,14 @@
 # TLS Terminal Messenger
 
-This project is a minimal terminal-based client/server messenger written in Python. Clients connect to the server over TLS, register usernames, list connected users, and send direct messages.
+This project is a terminal-based secure messenger written in Python. Clients connect to a central server over TLS, authenticate with CA-backed identity certificates, and exchange end-to-end encrypted direct messages.
 
-The transport is protected with TLS and server certificate verification. Each client has a long-term Ed25519 identity key and a long-term X25519 key-agreement key. User trust is handled with a small local CA and a persistent server-side account registry:
+Each client has a long-term Ed25519 identity key and a long-term X25519 key-agreement key. User trust is handled with a small local CA and a persistent server-side account registry:
 
 `CA -> username -> Ed25519 identity key -> X25519 key`
 
 On first registration the server checks that the username is free, issues a certificate for the user's Ed25519 identity key, and stores the permanent binding. On later logins the client presents that stored certificate and the server verifies the binding before allowing the session.
+
+Direct messages are also end-to-end encrypted at the application layer. The sender fetches the recipient's currently connected X25519 bundle, verifies the CA-issued Ed25519 certificate and X25519 binding signature locally, generates an ephemeral X25519 key for the message, derives an AES-256-GCM key via HKDF-SHA256, encrypts the plaintext, and signs the encrypted envelope with the sender's Ed25519 identity key. The server only forwards ciphertext and metadata needed for recipient-side verification.
 
 ## Layout
 
@@ -34,101 +36,36 @@ python3 -m pip install -r requirements.txt
 Run the setup script once:
 
 ```bash
-./ca/setup.sh
+bash ./ca/setup.sh
 ```
+
+Use `bash` here because `setup.sh` is a shell script. `python3 -m ...` is only for running Python modules like the server and client.
 
 It creates:
 
 - `ca/certs/ca-cert.pem` and `ca/certs/ca-key.pem`
 - `ca/certs/server-cert.pem` and `ca/certs/server-key.pem`
 
-If you want to generate them manually, use these exact commands.
-
-Create an OpenSSL extension file for the server certificate:
-
-```bash
-cat > ca/certs/server-ext.cnf <<'EOF'
-basicConstraints=critical,CA:false
-keyUsage=critical,digitalSignature,keyEncipherment
-subjectAltName=DNS:localhost,IP:127.0.0.1
-extendedKeyUsage=serverAuth
-subjectKeyIdentifier=hash
-authorityKeyIdentifier=keyid,issuer
-EOF
-```
-
-Create a local CA certificate with explicit CA extensions:
-
-```bash
-openssl req -x509 -new -nodes -days 365 -newkey rsa:2048 \
-  -keyout ca/certs/ca-key.pem \
-  -out ca/certs/ca-cert.pem \
-  -subj "/CN=Messenger Local CA" \
-  -addext "basicConstraints=critical,CA:true" \
-  -addext "keyUsage=critical,keyCertSign,cRLSign"
-```
-
-Create a server key and certificate signing request:
-
-```bash
-openssl req -new -nodes -newkey rsa:2048 \
-  -keyout ca/certs/server-key.pem \
-  -out ca/certs/server.csr \
-  -subj "/CN=localhost"
-```
-
-Sign the server certificate with the local CA:
-
-```bash
-openssl x509 -req -days 365 \
-  -in ca/certs/server.csr \
-  -CA ca/certs/ca-cert.pem \
-  -CAkey ca/certs/ca-key.pem \
-  -CAcreateserial \
-  -out ca/certs/server-cert.pem \
-  -extfile ca/certs/server-ext.cnf
-```
-
-If you previously generated certificates using older instructions, delete the old files in `ca/certs/` and regenerate them. An older CA without the proper extensions can trigger:
-
-```text
-[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: CA cert does not include key usage extension
-```
-
 ## How to Run
 
-Start the TLS server:
+Start the server in one terminal:
 
 ```bash
 python3 -m server
 ```
+Use `python3 -m server` because `server` is a Python package with an entrypoint.
 
-Optional arguments:
-
-```bash
-python3 -m server --host 127.0.0.1 --port 8888 \
-  --certfile ca/certs/server-cert.pem \
-  --keyfile ca/certs/server-key.pem \
-  --ca-cert ca/certs/ca-cert.pem \
-  --ca-key ca/certs/ca-key.pem \
-  --accounts-file server/data/accounts.json \
-  --tls-min-version 1.3
-```
-
-Start one or more clients in separate terminals:
+Start a client in another terminal:
 
 ```bash
 python3 -m client
 ```
+Use `python3 -m client` because `client` is also a Python package with an entrypoint.
 
-Optional arguments:
+Start another client in a third terminal:
 
 ```bash
-python3 -m client --host 127.0.0.1 --port 8888 \
-  --ca-cert ca/certs/ca-cert.pem \
-  --server-name localhost \
-  --tls-min-version 1.3 \
-  --identity-dir client/identities/alice
+python3 -m client
 ```
 
 Default connection settings:
@@ -173,12 +110,7 @@ Because the username is part of the long-term identity:
 - rename is intentionally rejected
 - if a user loses their private keys, account recovery is out of scope
 
-If you want multiple local clients on the same machine, give each one a different identity directory, for example:
-
-```bash
-python3 -m client --identity-dir client-identities/alice
-python3 -m client --identity-dir client-identities/bob
-```
+By default, each username uses its own identity directory under `client/identities/<username>`, so running multiple local clients is fine as long as you log in with different usernames.
 
 ## Client Commands
 
@@ -203,26 +135,6 @@ python3 -m client --identity-dir client-identities/bob
 ```text
 [from alice]: hello
 ```
-
-## Current Limitations
-
-- No end-to-end encryption yet
-- No password-based accounts
-- No application-layer message signatures yet
-- No offline message delivery
-- No message history or persistent message storage
-- Connected sessions are stored in memory only while users are online
-- Direct messages only, no group chats
-
-## Extension Path
-
-This layout is designed to be extended later with:
-
-- end-to-end encryption
-- signed application messages
-- persistent or offline message storage
-- richer account management
-- group chats
 
 ## Testing
 

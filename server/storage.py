@@ -16,6 +16,8 @@ class Session:
     writer: Any
     address: str
     public_identity: PublicIdentity
+    key_agreement_signature: str
+    identity_certificate: str
 
 
 class SessionStore:
@@ -27,7 +29,13 @@ class SessionStore:
         self._by_signing_key: dict[str, Session] = {}
 
     def register(
-        self, username: str, writer: Any, address: str, public_identity: PublicIdentity
+        self,
+        username: str,
+        writer: Any,
+        address: str,
+        public_identity: PublicIdentity,
+        key_agreement_signature: str,
+        identity_certificate: str,
     ) -> tuple[bool, str | None]:
         if username in self._by_username:
             return False, "username is already connected"
@@ -39,6 +47,8 @@ class SessionStore:
             writer=writer,
             address=address,
             public_identity=public_identity,
+            key_agreement_signature=key_agreement_signature,
+            identity_certificate=identity_certificate,
         )
         self._by_username[username] = session
         self._by_writer[writer] = session
