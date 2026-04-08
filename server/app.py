@@ -124,6 +124,7 @@ async def handle_client(
 
         auth_mode = first_message["type"]
         username = first_message["username"].strip()
+        password = str(first_message["password"])
         try:
             public_identity = validate_public_identity(
                 first_message["signing_public_key"],
@@ -171,14 +172,15 @@ async def handle_client(
 
         account = accounts.get(username)
         created_account = False
+        migrated_password = False
 
         if auth_mode == "register":
-            if account is not None and account.signing_public_key != public_identity.signing_public_key:
+            if account is not None:
                 await safe_send(
                     writer,
                     {
                         "type": "register_error",
-                        "text": f"Username '{username}' is already registered.",
+                        "text": f"Username '{username}' is already registered. Log in instead.",
                     },
                 )
                 log(f"rejected registration from {address}: username already registered ('{username}')")
@@ -212,6 +214,7 @@ async def handle_client(
                         username,
                         public_identity,
                         identity_certificate,
+                        password,
                     )
                 except AccountRegistryError as exc:
                     await safe_send(
@@ -269,6 +272,30 @@ async def handle_client(
                 log(f"rejected login from {address}: stored identity mismatch ('{username}')")
                 return
 
+            try:
+                password_valid, migrated_password = accounts.verify_or_set_password(username, password)
+            except AccountRegistryError as exc:
+                await safe_send(
+                    writer,
+                    {
+                        "type": "register_error",
+                        "text": f"Account registry error: {exc}",
+                    },
+                )
+                log(f"rejected login from {address}: password registry error ({exc})")
+                return
+
+            if not password_valid:
+                await safe_send(
+                    writer,
+                    {
+                        "type": "register_error",
+                        "text": "Invalid password.",
+                    },
+                )
+                log(f"rejected login from {address}: invalid password ('{username}')")
+                return
+
         assert account is not None
         if account.key_agreement_public_key != public_identity.key_agreement_public_key:
             account = accounts.update_key_agreement_key(
@@ -312,10 +339,11 @@ async def handle_client(
                 "text": f"Welcome, {username}. Type /help to see commands.",
             },
         )
+        status = "registered" if created_account else "authenticated"
+        if migrated_password:
+            status += " with password migration"
         log(
-            ("registered " if created_account else "authenticated ")
-            + 
-            f"{username} from {address} "
+            f"{status} {username} from {address} "
             f"(sign={public_identity.signing_fingerprint[:16]}, "
             f"x25519={public_identity.key_agreement_fingerprint[:16]})"
         )

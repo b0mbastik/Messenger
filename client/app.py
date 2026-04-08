@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
+import os
 from pathlib import Path
 import ssl
 import sys
@@ -11,6 +13,7 @@ import sys
 from cryptography import x509
 from ca.cert_utils import CertificateError, load_ca_certificate
 from ca.tls_utils import build_client_ssl_context, parse_tls_version
+from client.session import clear_password_session, load_saved_password, save_password_session
 from shared.e2ee import (
     MessageCryptoError,
     RecipientBundle,
@@ -22,6 +25,7 @@ from shared.identity import (
     ClientIdentity,
     default_certificate_path,
     default_identity_dir_for_username,
+    IDENTITY_FILE,
     IdentityError,
     load_or_create_identity,
 )
@@ -34,6 +38,8 @@ HELP_TEXT = """Available commands:
 /users                 list currently connected users
 /msg <user> <text>     send a direct message
 /quit                  disconnect and exit"""
+PASSWORD_ENV = "MESSENGER_PASSWORD"
+LEGACY_IDENTITY_PASSPHRASE_ENV = "MESSENGER_IDENTITY_PASSPHRASE"
 
 
 def parse_args() -> argparse.Namespace:
@@ -193,7 +199,29 @@ class MessengerClient:
                 )
                 continue
 
-            identity = load_or_create_identity(self.resolve_identity_dir(username))
+            identity_dir = self.resolve_identity_dir(username)
+            identity_path = identity_dir / IDENTITY_FILE
+            password, password_source = await self.resolve_account_password(
+                username=username,
+                identity_dir=identity_dir,
+                existing_identity=identity_path.exists(),
+            )
+            try:
+                identity = load_or_create_identity(identity_dir, passphrase=password)
+            except IdentityError as exc:
+                if password_source == "env":
+                    raise IdentityError(
+                        f"Configured password from {PASSWORD_ENV} could not unlock the local identity."
+                    ) from exc
+                if password_source == "saved":
+                    clear_password_session(identity_dir)
+                    print_line(
+                        "[error]: ",
+                        "Saved local session could not unlock the identity. Enter your password again.",
+                    )
+                    continue
+                print_line("[error]: ", f"identity error: {exc}")
+                continue
             self.identity = identity
             certificate_path = self.resolve_certificate_path(identity)
             certificate_pem = self.load_identity_certificate(identity)
@@ -208,6 +236,7 @@ class MessengerClient:
             auth_message = {
                 "type": "register" if is_first_registration else "login",
                 "username": username,
+                "password": password,
             }
             auth_message.update(
                 {
@@ -228,6 +257,7 @@ class MessengerClient:
             if response["type"] == "register_ok":
                 self.username = response["username"]
                 self.save_identity_certificate(certificate_path, str(response["identity_certificate"]))
+                save_password_session(identity_dir, username, password)
                 status = "registered" if is_first_registration else "authenticated"
                 print_line("[system]: ", f"{status} as {self.username}")
 
@@ -236,7 +266,52 @@ class MessengerClient:
                     print_line("[system]: ", welcome["text"])
                 return
 
+            if response["text"] == "Invalid password." and password_source == "saved":
+                clear_password_session(identity_dir)
+                print_line(
+                    "[error]: ",
+                    "Saved local session was rejected by the server. Enter your password again.",
+                )
+                continue
+            if response["text"] == "Invalid password." and password_source == "env":
+                raise IdentityError(f"Configured password from {PASSWORD_ENV} was rejected by the server.")
             print_line("[error]: ", response["text"])
+
+    async def resolve_account_password(
+        self,
+        *,
+        username: str,
+        identity_dir: Path,
+        existing_identity: bool,
+    ) -> tuple[str, str]:
+        configured = os.environ.get(PASSWORD_ENV)
+        if configured is not None:
+            return configured, "env"
+
+        legacy = os.environ.get(LEGACY_IDENTITY_PASSPHRASE_ENV)
+        if legacy is not None:
+            return legacy, "env"
+
+        saved_password = load_saved_password(identity_dir, username)
+        if saved_password is not None:
+            print_line("[system]: ", f"loaded saved local session for {username}")
+            return saved_password, "saved"
+
+        if existing_identity:
+            password = await asyncio.to_thread(getpass.getpass, "Password: ")
+            return password, "prompt"
+
+        while True:
+            first = await asyncio.to_thread(getpass.getpass, "Create password: ")
+            if not first:
+                print_line("[error]: ", "Password must not be empty.")
+                continue
+
+            second = await asyncio.to_thread(getpass.getpass, "Confirm password: ")
+            if first != second:
+                print_line("[error]: ", "Passwords did not match.")
+                continue
+            return first, "prompt"
 
     def resolve_identity_dir(self, username: str) -> Path:
         if self.identity_dir:

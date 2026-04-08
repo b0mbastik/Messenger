@@ -1,12 +1,12 @@
 # TLS Terminal Messenger
 
-This project is a terminal-based secure messenger written in Python. Clients connect to a central server over TLS, authenticate with CA-backed identity certificates, and exchange end-to-end encrypted direct messages.
+This project is a terminal-based secure messenger written in Python. Clients connect to a central server over TLS, authenticate with a password plus a CA-backed identity certificate, and exchange end-to-end encrypted direct messages.
 
 Each client has a long-term Ed25519 identity key and a long-term X25519 key-agreement key. User trust is handled with a small local CA and a persistent server-side account registry:
 
 `CA -> username -> Ed25519 identity key -> X25519 key`
 
-On first registration the server checks that the username is free, issues a certificate for the user's Ed25519 identity key, and stores the permanent binding. On later logins the client presents that stored certificate and the server verifies the binding before allowing the session.
+On first registration the server checks that the username is free, stores a password verifier, issues a certificate for the user's Ed25519 identity key, and stores the permanent binding. On later logins the client presents the stored certificate and password, and the server verifies both before allowing the session.
 
 Direct messages are also end-to-end encrypted at the application layer. The sender fetches the recipient's currently connected X25519 bundle, verifies the CA-issued Ed25519 certificate and X25519 binding signature locally, generates an ephemeral X25519 key for the message, derives an AES-256-GCM key via HKDF-SHA256, encrypts the plaintext, and signs the encrypted envelope with the sender's Ed25519 identity key. The server only forwards ciphertext and metadata needed for recipient-side verification.
 
@@ -83,26 +83,33 @@ Each client profile stores two long-term private keys locally:
 - Ed25519 as the certified long-term signing and identity key
 - X25519 as the long-term key-agreement key
 
-The client stores them in `identity.json` inside the selected identity directory. By default, if you do not pass `--identity-dir`, the client uses `client/identities/<username>` after you enter the username.
+The client stores them in `identity.json` inside the selected identity directory. The private keys are encrypted on disk with a password-protected PKCS#8 keystore. By default, if you do not pass `--identity-dir`, the client uses `client/identities/<username>` after you enter the username.
+
+The same password is used for both account login and local identity unlock, so the client only asks for one secret. After a successful login, the client stores an encrypted remembered session in the identity directory so later launches on the same machine can reuse it automatically. For non-interactive runs, you can provide the password with `MESSENGER_PASSWORD`. The older `MESSENGER_IDENTITY_PASSPHRASE` variable is still accepted as a fallback.
 
 On first use for a new username:
 
 - the client asks for a username
-- the client generates or loads the local Ed25519/X25519 identity
-- the client sends the username, the two public keys, and an Ed25519 signature over `username || X25519 public key`
-- if the username is free, the server signs and returns a client certificate for that username and Ed25519 key
+- the client asks you to create a password
+- the client generates or loads the local Ed25519/X25519 identity using that password
+- the client sends the username, password, the two public keys, and an Ed25519 signature over `username || X25519 public key`
+- if the username is free, the server stores a password hash, signs and returns a client certificate for that username and Ed25519 key
 - the client stores that certificate locally as `identity-cert.pem`
+- the client stores a remembered local session alongside the identity files
 
 On later logins:
 
-- the client loads the stored certificate
-- the client sends the certificate plus the identity bundle
+- the client loads the stored certificate and remembered local session if present
+- otherwise the client asks for the password
+- the client uses that password to unlock the local identity
+- the client sends the password, certificate, and identity bundle
+- the server verifies the password against the stored scrypt hash
 - the server verifies that the certificate is signed by the CA
 - the server verifies that the certificate subject matches the username
 - the server verifies that the Ed25519 key matches the certificate
 - the server verifies that the Ed25519 key signs the current X25519 key
 
-The server stores the permanent username binding in `server/data/accounts.json`, so usernames remain bound to the same Ed25519 identity across server restarts.
+The server stores the permanent username binding and password verifier in `server/data/accounts.json`, so usernames remain bound to the same Ed25519 identity across server restarts.
 
 Because the username is part of the long-term identity:
 

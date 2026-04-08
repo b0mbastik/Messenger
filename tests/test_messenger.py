@@ -14,7 +14,8 @@ from pathlib import Path
 
 from ca.cert_utils import load_ca_certificate, load_ca_private_key
 from ca.tls_utils import build_client_ssl_context, build_server_ssl_context, parse_tls_version
-from server.accounts import AccountRegistry
+from client.session import clear_password_session, load_saved_password, save_password_session
+from server.accounts import AccountRegistry, hash_password, verify_password
 from server.app import handle_client, shutdown_clients
 from server.storage import SessionStore
 from shared.e2ee import (
@@ -26,6 +27,7 @@ from shared.e2ee import (
 )
 from shared.identity import (
     DEFAULT_IDENTITIES_DIR,
+    ENCRYPTED_IDENTITY_VERSION,
     IdentityError,
     default_certificate_path,
     default_identity_dir_for_username,
@@ -34,6 +36,8 @@ from shared.identity import (
     validate_public_identity,
 )
 from shared.protocol import ProtocolError, read_message, send_message, validate_message
+
+TEST_ACCOUNT_PASSWORD = "test-password"
 
 
 class TestPeer:
@@ -48,6 +52,7 @@ class TestPeer:
         ca_certificate: object,
         username: str,
         identity_dir: Path,
+        password: str = TEST_ACCOUNT_PASSWORD,
     ) -> None:
         self.host = host
         self.port = port
@@ -55,7 +60,11 @@ class TestPeer:
         self.server_name = server_name
         self.ca_certificate = ca_certificate
         self.username = username
-        self.identity = load_or_create_identity(identity_dir)
+        self.password = password
+        self.identity = load_or_create_identity(
+            identity_dir,
+            passphrase=password,
+        )
         self.signing_public_key = self.identity.public_identity.signing_public_key
         self.key_agreement_public_key = self.identity.public_identity.key_agreement_public_key
         self.certificate_path = default_certificate_path(self.identity.path.parent)
@@ -79,13 +88,14 @@ class TestPeer:
         return await self.login(username)
 
     async def register(
-        self, username: str | None = None
+        self, username: str | None = None, *, password: str | None = None
     ) -> tuple[dict[str, object] | None, dict[str, object] | None]:
         claimed_username = username or self.username
         await self.send(
             {
                 "type": "register",
                 "username": claimed_username,
+                "password": password or self.password,
                 "signing_public_key": self.signing_public_key,
                 "key_agreement_public_key": self.key_agreement_public_key,
                 "key_agreement_signature": self.identity.sign_key_agreement_binding(
@@ -100,6 +110,7 @@ class TestPeer:
         username: str | None = None,
         *,
         certificate_pem: str | None = None,
+        password: str | None = None,
     ) -> tuple[dict[str, object] | None, dict[str, object] | None]:
         claimed_username = username or self.username
         certificate = certificate_pem or self.certificate_pem
@@ -110,6 +121,7 @@ class TestPeer:
             {
                 "type": "login",
                 "username": claimed_username,
+                "password": password or self.password,
                 "signing_public_key": self.signing_public_key,
                 "key_agreement_public_key": self.key_agreement_public_key,
                 "key_agreement_signature": self.identity.sign_key_agreement_binding(
@@ -366,7 +378,13 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
         await self.stop_server()
         await self.start_server()
 
-    async def make_peer(self, username: str, *, identity_dir: Path | None = None) -> TestPeer:
+    async def make_peer(
+        self,
+        username: str,
+        *,
+        identity_dir: Path | None = None,
+        password: str = TEST_ACCOUNT_PASSWORD,
+    ) -> TestPeer:
         identity_path = identity_dir or self.runtime_dir / f"peer-{len(self.peers)}"
         peer = TestPeer(
             self.host,
@@ -376,6 +394,7 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
             self.ca_certificate,
             username,
             identity_path,
+            password=password,
         )
         await peer.connect()
         self.peers.append(peer)
@@ -399,6 +418,12 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
         assert account is not None
         self.assertEqual(account.signing_public_key, alice.signing_public_key)
         self.assertEqual(account.key_agreement_public_key, alice.key_agreement_public_key)
+        self.assertIsNotNone(account.password_salt)
+        self.assertIsNotNone(account.password_hash)
+        self.assertNotEqual(account.password_hash, TEST_ACCOUNT_PASSWORD)
+        assert account.password_salt is not None
+        assert account.password_hash is not None
+        self.assertTrue(verify_password(TEST_ACCOUNT_PASSWORD, account.password_salt, account.password_hash))
 
     async def test_later_login_with_stored_certificate_succeeds(self) -> None:
         alice = await self.make_peer("alice")
@@ -456,7 +481,7 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
             response,
             {
                 "type": "register_error",
-                "text": "Username 'alice' is already registered.",
+                "text": "Username 'alice' is already registered. Log in instead.",
             },
         )
         self.assertIsNone(welcome)
@@ -499,6 +524,24 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(welcome)
         self.assertIsNone(await bob.recv())
+
+    async def test_login_rejects_wrong_password(self) -> None:
+        alice = await self.make_peer("alice")
+        await alice.register()
+        alice_identity_dir = alice.identity.path.parent
+        await alice.disconnect()
+
+        alice_again = await self.make_peer("alice", identity_dir=alice_identity_dir)
+        response, welcome = await alice_again.login(password="wrong-password")
+        self.assertEqual(
+            response,
+            {
+                "type": "register_error",
+                "text": "Invalid password.",
+            },
+        )
+        self.assertIsNone(welcome)
+        self.assertIsNone(await alice_again.recv())
 
     async def test_direct_message_is_delivered(self) -> None:
         alice = await self.make_peer("alice")
@@ -566,6 +609,22 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(MessageCryptoError):
             bob.decrypt_incoming_message(tampered)
+
+    async def test_forged_sender_identity_fails_verification(self) -> None:
+        alice = await self.make_peer("alice")
+        bob = await self.make_peer("bob")
+        await alice.authenticate()
+        await bob.authenticate()
+
+        await alice.send_encrypted_message("bob", "hello")
+        incoming = await bob.recv()
+        self.assertIsNotNone(incoming)
+        assert incoming is not None
+        forged = dict(incoming)
+        forged["from"] = "mallory"
+
+        with self.assertRaises(MessageCryptoError):
+            bob.decrypt_incoming_message(forged)
 
     async def test_rename_is_rejected(self) -> None:
         alice = await self.make_peer("alice")
@@ -669,6 +728,7 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
             {
                 "type": "register",
                 "username": "alice",
+                "password": TEST_ACCOUNT_PASSWORD,
                 "signing_public_key": "not-base64",
                 "key_agreement_public_key": peer.key_agreement_public_key,
                 "key_agreement_signature": peer.identity.sign_key_agreement_binding("alice"),
@@ -690,6 +750,7 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
             {
                 "type": "register",
                 "username": "alice",
+                "password": TEST_ACCOUNT_PASSWORD,
                 "signing_public_key": peer.signing_public_key,
                 "key_agreement_public_key": peer.key_agreement_public_key,
                 "key_agreement_signature": peer.identity.sign_key_agreement_binding("mallory"),
@@ -768,6 +829,7 @@ class ProtocolValidationTests(unittest.TestCase):
                 {
                     "type": "login",
                     "username": "alice",
+                    "password": "pw",
                     "signing_public_key": "a",
                     "key_agreement_public_key": "b",
                     "key_agreement_signature": "c",
@@ -800,6 +862,54 @@ class TlsConfigurationTests(unittest.TestCase):
                 )
 
 
+class AccountRegistryTests(unittest.TestCase):
+    def test_hash_password_round_trip(self) -> None:
+        salt, digest = hash_password(TEST_ACCOUNT_PASSWORD)
+        self.assertTrue(verify_password(TEST_ACCOUNT_PASSWORD, salt, digest))
+        self.assertFalse(verify_password("wrong-password", salt, digest))
+
+    def test_registry_loads_legacy_account_without_password_and_sets_it_on_login(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry_path = Path(temp_dir) / "accounts.json"
+            registry_path.write_text(
+                json.dumps(
+                    {
+                        "alice": {
+                            "username": "alice",
+                            "signing_public_key": "signing",
+                            "key_agreement_public_key": "agreement",
+                            "identity_certificate": "cert",
+                            "created_at": "2026-04-08T10:00:00+00:00",
+                            "updated_at": "2026-04-08T10:00:00+00:00",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            registry = AccountRegistry(registry_path)
+            verified, migrated = registry.verify_or_set_password("alice", TEST_ACCOUNT_PASSWORD)
+            self.assertTrue(verified)
+            self.assertTrue(migrated)
+
+            account = registry.get("alice")
+            assert account is not None
+            self.assertTrue(account.has_password)
+
+
+class LocalSessionTests(unittest.TestCase):
+    def test_saved_password_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            save_password_session(temp_dir, "alice", TEST_ACCOUNT_PASSWORD)
+            self.assertEqual(load_saved_password(temp_dir, "alice"), TEST_ACCOUNT_PASSWORD)
+
+    def test_clear_saved_password_removes_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            save_password_session(temp_dir, "alice", TEST_ACCOUNT_PASSWORD)
+            clear_password_session(temp_dir)
+            self.assertIsNone(load_saved_password(temp_dir, "alice"))
+
+
 class IdentityTests(unittest.TestCase):
     def test_default_identity_dir_uses_username(self) -> None:
         expected = Path(DEFAULT_IDENTITIES_DIR) / "alice"
@@ -811,8 +921,8 @@ class IdentityTests(unittest.TestCase):
 
     def test_identity_persists_across_loads(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            first = load_or_create_identity(temp_dir)
-            second = load_or_create_identity(temp_dir)
+            first = load_or_create_identity(temp_dir, passphrase=TEST_ACCOUNT_PASSWORD)
+            second = load_or_create_identity(temp_dir, passphrase=TEST_ACCOUNT_PASSWORD)
 
             self.assertEqual(first.signing_fingerprint, second.signing_fingerprint)
             self.assertEqual(
@@ -822,15 +932,17 @@ class IdentityTests(unittest.TestCase):
 
     def test_identity_file_is_written(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            identity = load_or_create_identity(temp_dir)
+            identity = load_or_create_identity(temp_dir, passphrase=TEST_ACCOUNT_PASSWORD)
             payload = json.loads(identity.path.read_text(encoding="utf-8"))
-            self.assertEqual(payload["version"], 1)
-            self.assertIn("signing_private_key", payload)
-            self.assertIn("key_agreement_private_key", payload)
+            self.assertEqual(payload["version"], ENCRYPTED_IDENTITY_VERSION)
+            self.assertIn("signing_private_key_pem", payload)
+            self.assertIn("key_agreement_private_key_pem", payload)
+            self.assertIn("ENCRYPTED PRIVATE KEY", payload["signing_private_key_pem"])
+            self.assertIn("ENCRYPTED PRIVATE KEY", payload["key_agreement_private_key_pem"])
 
     def test_validate_public_identity_accepts_generated_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            identity = load_or_create_identity(temp_dir)
+            identity = load_or_create_identity(temp_dir, passphrase=TEST_ACCOUNT_PASSWORD)
             public_identity = identity.public_identity
 
             validated = validate_public_identity(
@@ -845,7 +957,7 @@ class IdentityTests(unittest.TestCase):
 
     def test_validate_public_identity_rejects_malformed_key_length(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            identity = load_or_create_identity(temp_dir)
+            identity = load_or_create_identity(temp_dir, passphrase=TEST_ACCOUNT_PASSWORD)
             public_identity = identity.public_identity
 
             with self.assertRaises(IdentityError):
@@ -853,6 +965,30 @@ class IdentityTests(unittest.TestCase):
                     public_identity.signing_public_key,
                     "AQ==",
                 )
+
+    def test_identity_rejects_wrong_passphrase(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            load_or_create_identity(temp_dir, passphrase=TEST_ACCOUNT_PASSWORD)
+
+            with self.assertRaises(IdentityError):
+                load_or_create_identity(temp_dir, passphrase="wrong-passphrase")
+
+    def test_identity_rejects_legacy_plaintext_format(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            identity_path = Path(temp_dir) / "identity.json"
+            identity_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "signing_private_key": "AQ==",
+                        "key_agreement_private_key": "AQ==",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(IdentityError):
+                load_or_create_identity(temp_dir, passphrase=TEST_ACCOUNT_PASSWORD)
 
     def test_decode_key_bytes_rejects_non_base64(self) -> None:
         with self.assertRaises(IdentityError):

@@ -8,7 +8,9 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
@@ -18,13 +20,14 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey,
     X25519PublicKey,
 )
-from cryptography.exceptions import InvalidSignature
+
 from shared.paths import DEFAULT_IDENTITIES_ROOT
 
 IDENTITY_FILE = "identity.json"
 IDENTITY_CERT_FILE = "identity-cert.pem"
 DEFAULT_IDENTITIES_DIR = str(DEFAULT_IDENTITIES_ROOT)
 KEY_AGREEMENT_BINDING_CONTEXT = b"messenger-key-agreement:v1"
+ENCRYPTED_IDENTITY_VERSION = 2
 
 
 class IdentityError(Exception):
@@ -78,23 +81,20 @@ class ClientIdentity:
             ),
         )
 
-    def private_payload(self) -> dict[str, str | int]:
+    def private_payload(self, passphrase: str | bytes) -> dict[str, str | int]:
+        encoded_passphrase = normalize_identity_passphrase(passphrase)
         return {
-            "version": 1,
-            "signing_private_key": encode_private_key_bytes(
-                self.signing_private_key.private_bytes(
-                    encoding=serialization.Encoding.Raw,
-                    format=serialization.PrivateFormat.Raw,
-                    encryption_algorithm=serialization.NoEncryption(),
-                )
-            ),
-            "key_agreement_private_key": encode_private_key_bytes(
-                self.key_agreement_private_key.private_bytes(
-                    encoding=serialization.Encoding.Raw,
-                    format=serialization.PrivateFormat.Raw,
-                    encryption_algorithm=serialization.NoEncryption(),
-                )
-            ),
+            "version": ENCRYPTED_IDENTITY_VERSION,
+            "signing_private_key_pem": self.signing_private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.BestAvailableEncryption(encoded_passphrase),
+            ).decode("ascii"),
+            "key_agreement_private_key_pem": self.key_agreement_private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.BestAvailableEncryption(encoded_passphrase),
+            ).decode("ascii"),
         }
 
     @property
@@ -117,7 +117,26 @@ class ClientIdentity:
         return encode_public_key_bytes(signature)
 
 
-def load_or_create_identity(identity_dir: str | Path) -> ClientIdentity:
+def normalize_identity_passphrase(passphrase: str | bytes) -> bytes:
+    """Normalize and validate the identity passphrase."""
+
+    if isinstance(passphrase, str):
+        encoded = passphrase.encode("utf-8")
+    elif isinstance(passphrase, bytes):
+        encoded = passphrase
+    else:
+        raise IdentityError("Identity passphrase must be text or bytes.")
+
+    if not encoded:
+        raise IdentityError("Identity passphrase must not be empty.")
+    return encoded
+
+
+def load_or_create_identity(
+    identity_dir: str | Path,
+    *,
+    passphrase: str | bytes,
+) -> ClientIdentity:
     """Load an existing client identity or create a new one."""
 
     identity_path = Path(identity_dir) / IDENTITY_FILE
@@ -127,15 +146,16 @@ def load_or_create_identity(identity_dir: str | Path) -> ClientIdentity:
     except OSError:
         pass
 
+    encoded_passphrase = normalize_identity_passphrase(passphrase)
     if identity_path.exists():
-        return load_identity(identity_path)
+        return load_identity(identity_path, passphrase=encoded_passphrase)
 
     identity = ClientIdentity(
         signing_private_key=Ed25519PrivateKey.generate(),
         key_agreement_private_key=X25519PrivateKey.generate(),
         path=identity_path,
     )
-    save_identity(identity)
+    save_identity(identity, passphrase=encoded_passphrase)
     return identity
 
 
@@ -156,7 +176,11 @@ def default_certificate_path(identity_dir: str | Path) -> Path:
     return Path(identity_dir) / IDENTITY_CERT_FILE
 
 
-def load_identity(identity_path: str | Path) -> ClientIdentity:
+def load_identity(
+    identity_path: str | Path,
+    *,
+    passphrase: str | bytes,
+) -> ClientIdentity:
     """Load a client identity from disk."""
 
     path = Path(identity_path)
@@ -167,39 +191,77 @@ def load_identity(identity_path: str | Path) -> ClientIdentity:
     except json.JSONDecodeError as exc:
         raise IdentityError(f"Identity file '{path}' is not valid JSON.") from exc
 
-    if payload.get("version") != 1:
-        raise IdentityError(f"Identity file '{path}' has an unsupported version.")
+    version = payload.get("version")
+    if version == ENCRYPTED_IDENTITY_VERSION:
+        return _load_encrypted_identity(path, payload, passphrase=passphrase)
 
-    try:
-        signing_private_key = Ed25519PrivateKey.from_private_bytes(
-            decode_key_bytes(payload["signing_private_key"])
-        )
-        key_agreement_private_key = X25519PrivateKey.from_private_bytes(
-            decode_key_bytes(payload["key_agreement_private_key"])
-        )
-    except KeyError as exc:
-        raise IdentityError(f"Identity file '{path}' is missing '{exc.args[0]}'.") from exc
-    except ValueError as exc:
-        raise IdentityError(f"Identity file '{path}' contains invalid key material.") from exc
-
-    return ClientIdentity(
-        signing_private_key=signing_private_key,
-        key_agreement_private_key=key_agreement_private_key,
-        path=path,
+    raise IdentityError(
+        f"Identity file '{path}' has unsupported version '{version}'. "
+        f"Only encrypted version {ENCRYPTED_IDENTITY_VERSION} identities are accepted."
     )
 
 
-def save_identity(identity: ClientIdentity) -> None:
+def save_identity(identity: ClientIdentity, *, passphrase: str | bytes) -> None:
     """Persist a client identity to disk."""
 
     identity.path.write_text(
-        json.dumps(identity.private_payload(), indent=2, sort_keys=True) + "\n",
+        json.dumps(identity.private_payload(passphrase), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     try:
         os.chmod(identity.path, 0o600)
     except OSError:
         pass
+
+
+def _load_encrypted_identity(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    passphrase: str | bytes,
+) -> ClientIdentity:
+    try:
+        signing_private_key = _load_private_key_from_pem(
+            payload["signing_private_key_pem"],
+            passphrase,
+            expected_type=Ed25519PrivateKey,
+            field_name="signing_private_key_pem",
+        )
+        key_agreement_private_key = _load_private_key_from_pem(
+            payload["key_agreement_private_key_pem"],
+            passphrase,
+            expected_type=X25519PrivateKey,
+            field_name="key_agreement_private_key_pem",
+        )
+    except KeyError as exc:
+        raise IdentityError(f"Identity file '{path}' is missing '{exc.args[0]}'.") from exc
+
+    return ClientIdentity(
+        signing_private_key=signing_private_key,
+        key_agreement_private_key=key_agreement_private_key,
+        path=path,
+    )
+def _load_private_key_from_pem(
+    pem_text: str,
+    passphrase: str | bytes,
+    *,
+    expected_type: type,
+    field_name: str,
+) -> Any:
+    if not isinstance(pem_text, str) or not pem_text.strip():
+        raise IdentityError(f"Identity field '{field_name}' must be non-empty PEM text.")
+
+    try:
+        private_key = serialization.load_pem_private_key(
+            pem_text.encode("ascii"),
+            password=normalize_identity_passphrase(passphrase),
+        )
+    except (TypeError, ValueError) as exc:
+        raise IdentityError("Unable to decrypt identity private keys. Check the passphrase.") from exc
+
+    if not isinstance(private_key, expected_type):
+        raise IdentityError(f"Identity field '{field_name}' contains the wrong key type.")
+    return private_key
 
 
 def validate_public_identity(
@@ -254,12 +316,6 @@ def verify_key_agreement_binding(
         )
     except InvalidSignature as exc:
         raise IdentityError("Key-agreement public key signature is invalid.") from exc
-
-
-def encode_private_key_bytes(data: bytes) -> str:
-    return base64.b64encode(data).decode("ascii")
-
-
 def encode_public_key_bytes(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 

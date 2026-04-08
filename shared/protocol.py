@@ -18,12 +18,14 @@ class ProtocolError(Exception):
 _SCHEMAS: dict[str, dict[str, type | tuple[type, ...]]] = {
     "register": {
         "username": str,
+        "password": str,
         "signing_public_key": str,
         "key_agreement_public_key": str,
         "key_agreement_signature": str,
     },
     "login": {
         "username": str,
+        "password": str,
         "signing_public_key": str,
         "key_agreement_public_key": str,
         "key_agreement_signature": str,
