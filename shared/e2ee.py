@@ -36,10 +36,53 @@ ENVELOPE_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S+00:00"
 MAX_ENVELOPE_CLOCK_SKEW = timedelta(minutes=5)
 NONCE_SIZE = 12
 AES_KEY_SIZE = 32
+X25519_PUBLIC_KEY_SIZE = 32
+ED25519_SIGNATURE_SIZE = 64
+AESGCM_TAG_SIZE = 16
 
 
 class MessageCryptoError(Exception):
     """Raised when end-to-end encryption state is invalid."""
+
+
+class EnvelopeReplayCache:
+    """Tracks recently accepted envelopes and rejects duplicate message IDs."""
+
+    def __init__(self, *, max_skew: timedelta = MAX_ENVELOPE_CLOCK_SKEW) -> None:
+        self.max_skew = max_skew
+        self._seen: dict[tuple[str, str, str], datetime] = {}
+
+    def check_and_remember(
+        self,
+        envelope: EncryptedEnvelope,
+        *,
+        now: datetime | None = None,
+    ) -> datetime:
+        current_time = now or datetime.now(timezone.utc)
+        parsed_timestamp = validate_envelope_timestamp_freshness(
+            envelope,
+            now=current_time,
+            max_skew=self.max_skew,
+        )
+        self._purge_expired(current_time)
+
+        cache_key = (
+            envelope.sender_username,
+            envelope.recipient_username,
+            envelope.message_id,
+        )
+        if cache_key in self._seen:
+            raise MessageCryptoError("Encrypted envelope replay detected.")
+
+        self._seen[cache_key] = parsed_timestamp + self.max_skew
+        return parsed_timestamp
+
+    def _purge_expired(self, current_time: datetime) -> None:
+        expired_keys = [
+            key for key, expires_at in self._seen.items() if expires_at < current_time
+        ]
+        for key in expired_keys:
+            self._seen.pop(key, None)
 
 
 @dataclass(slots=True)
@@ -186,6 +229,7 @@ def decrypt_message_from_sender(
     sender_identity_certificate: str,
     envelope: EncryptedEnvelope | object,
     ca_certificate: x509.Certificate,
+    replay_cache: EnvelopeReplayCache | None = None,
 ) -> str:
     """Verify and decrypt an incoming direct message."""
 
@@ -228,9 +272,16 @@ def decrypt_message_from_sender(
             _decode_base64(parsed_envelope.ciphertext),
             _build_aad(parsed_envelope),
         )
-        return plaintext.decode("utf-8")
     except Exception as exc:
         raise MessageCryptoError(f"Message decryption failed: {exc}") from exc
+
+    try:
+        plaintext_text = plaintext.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise MessageCryptoError(f"Message decryption failed: {exc}") from exc
+    if replay_cache is not None:
+        replay_cache.check_and_remember(parsed_envelope)
+    return plaintext_text
 
 
 def parse_encrypted_envelope(envelope: EncryptedEnvelope | object) -> EncryptedEnvelope:
@@ -278,6 +329,28 @@ def parse_encrypted_envelope(envelope: EncryptedEnvelope | object) -> EncryptedE
             raise MessageCryptoError(
                 f"Encrypted envelope {field_name.removesuffix('_username')} must be a valid username."
             )
+
+    sender_ephemeral_public_key = _decode_base64(values["sender_ephemeral_public_key"])
+    if len(sender_ephemeral_public_key) != X25519_PUBLIC_KEY_SIZE:
+        raise MessageCryptoError(
+            "Encrypted envelope sender_ephemeral_public_key must encode 32 bytes."
+        )
+
+    nonce = _decode_base64(values["nonce"])
+    if len(nonce) != NONCE_SIZE:
+        raise MessageCryptoError(f"Encrypted envelope nonce must encode {NONCE_SIZE} bytes.")
+
+    ciphertext = _decode_base64(values["ciphertext"])
+    if len(ciphertext) < AESGCM_TAG_SIZE:
+        raise MessageCryptoError(
+            "Encrypted envelope ciphertext is too short to contain an AES-GCM tag."
+        )
+
+    signature = _decode_base64(values["signature"])
+    if len(signature) != ED25519_SIGNATURE_SIZE:
+        raise MessageCryptoError(
+            "Encrypted envelope signature must encode 64 bytes."
+        )
 
     return EncryptedEnvelope(**values)
 

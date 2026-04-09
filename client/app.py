@@ -14,6 +14,7 @@ from cryptography import x509
 from ca.cert_utils import CertificateError, load_ca_certificate
 from ca.tls_utils import build_client_ssl_context, parse_tls_version
 from shared.e2ee import (
+    EnvelopeReplayCache,
     MessageCryptoError,
     RecipientBundle,
     decrypt_message_from_sender,
@@ -153,6 +154,7 @@ class MessengerClient:
         self.reader: asyncio.StreamReader | None = None
         self.writer: asyncio.StreamWriter | None = None
         self.pending_user_bundle_requests: dict[str, asyncio.Future[RecipientBundle]] = {}
+        self.replay_cache = EnvelopeReplayCache()
 
     async def run(self) -> None:
         print("TLS Messenger")
@@ -503,6 +505,7 @@ class MessengerClient:
                 str(message["identity_certificate"]),
                 envelope,
                 self.ca_certificate,
+                replay_cache=self.replay_cache,
             )
         except MessageCryptoError as exc:
             print_line(

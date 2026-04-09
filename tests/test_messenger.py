@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from datetime import datetime, timedelta, timezone
 import json
 import shutil
@@ -19,6 +20,7 @@ from server.accounts import AccountRegistry, hash_password, verify_password
 from server.app import handle_client, shutdown_clients
 from server.storage import SessionStore
 from shared.e2ee import (
+    EnvelopeReplayCache,
     MessageCryptoError,
     RecipientBundle,
     decrypt_message_from_sender,
@@ -39,6 +41,10 @@ from shared.identity import (
 from shared.protocol import ProtocolError, read_message, send_message, validate_message
 
 TEST_ACCOUNT_PASSWORD = "test-password"
+DUMMY_PUBLIC_KEY = base64.b64encode(b"\x00" * 32).decode("ascii")
+DUMMY_NONCE = base64.b64encode(b"\x00" * 12).decode("ascii")
+DUMMY_CIPHERTEXT = base64.b64encode(b"\x00" * 16).decode("ascii")
+DUMMY_SIGNATURE = base64.b64encode(b"\x00" * 64).decode("ascii")
 
 
 def current_envelope_timestamp(*, offset: timedelta = timedelta()) -> str:
@@ -202,7 +208,12 @@ class TestPeer:
         )
         await self.send({"type": "direct_message", "to": recipient, "envelope": envelope})
 
-    def decrypt_incoming_message(self, message: dict[str, object]) -> str:
+    def decrypt_incoming_message(
+        self,
+        message: dict[str, object],
+        *,
+        replay_cache: EnvelopeReplayCache | None = None,
+    ) -> str:
         envelope = parse_encrypted_envelope(message["envelope"])
         return decrypt_message_from_sender(
             self.identity,
@@ -211,6 +222,7 @@ class TestPeer:
             str(message["identity_certificate"]),
             envelope,
             self.ca_certificate,
+            replay_cache=replay_cache,
         )
 
     async def disconnect(self) -> None:
@@ -622,6 +634,83 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(incoming["envelope"]["from"], "alice")
         self.assertEqual(bob.decrypt_incoming_message(incoming), "hello")
 
+    async def test_server_relays_opaque_envelope_without_modifying_ciphertext(self) -> None:
+        alice = await self.make_peer("alice")
+        bob = await self.make_peer("bob")
+        await alice.authenticate()
+        await bob.authenticate()
+
+        response = await alice.lookup_user("bob")
+        self.assertIsNotNone(response)
+        assert response is not None
+        bundle = validate_recipient_bundle(
+            RecipientBundle(
+                username=str(response["username"]),
+                signing_public_key=str(response["signing_public_key"]),
+                key_agreement_public_key=str(response["key_agreement_public_key"]),
+                key_agreement_signature=str(response["key_agreement_signature"]),
+                identity_certificate=str(response["identity_certificate"]),
+            ),
+            self.ca_certificate,
+        )
+        envelope = encrypt_message_for_recipient(
+            alice.identity,
+            alice.username,
+            bundle,
+            "opaque payload",
+        )
+
+        await alice.send({"type": "direct_message", "to": "bob", "envelope": envelope})
+        incoming = await bob.recv()
+        self.assertIsNotNone(incoming)
+        assert incoming is not None
+        self.assertEqual(incoming["type"], "incoming_message")
+        self.assertEqual(incoming["envelope"], envelope)
+        self.assertNotIn("plaintext", incoming["envelope"])
+        self.assertEqual(bob.decrypt_incoming_message(incoming), "opaque payload")
+
+    async def test_direct_message_rejects_replayed_envelope(self) -> None:
+        alice = await self.make_peer("alice")
+        bob = await self.make_peer("bob")
+        await alice.authenticate()
+        await bob.authenticate()
+
+        response = await alice.lookup_user("bob")
+        self.assertIsNotNone(response)
+        assert response is not None
+        bundle = validate_recipient_bundle(
+            RecipientBundle(
+                username=str(response["username"]),
+                signing_public_key=str(response["signing_public_key"]),
+                key_agreement_public_key=str(response["key_agreement_public_key"]),
+                key_agreement_signature=str(response["key_agreement_signature"]),
+                identity_certificate=str(response["identity_certificate"]),
+            ),
+            self.ca_certificate,
+        )
+        envelope = encrypt_message_for_recipient(
+            alice.identity,
+            alice.username,
+            bundle,
+            "hello once",
+        )
+
+        await alice.send({"type": "direct_message", "to": "bob", "envelope": envelope})
+        first_incoming = await bob.recv()
+        self.assertIsNotNone(first_incoming)
+        assert first_incoming is not None
+        self.assertEqual(bob.decrypt_incoming_message(first_incoming), "hello once")
+
+        await alice.send({"type": "direct_message", "to": "bob", "envelope": envelope})
+        response = await alice.recv()
+        self.assertEqual(
+            response,
+            {
+                "type": "delivery_error",
+                "text": "Invalid encrypted envelope: Encrypted envelope replay detected.",
+            },
+        )
+
     async def test_direct_message_to_missing_user_returns_delivery_error(self) -> None:
         alice = await self.make_peer("alice")
         await alice.authenticate()
@@ -637,9 +726,9 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
                     "from": "alice",
                     "to": "nobody",
                     "sender_ephemeral_public_key": alice.key_agreement_public_key,
-                    "nonce": "AAAAAAAAAAAAAAAA",
-                    "ciphertext": "AQ==",
-                    "signature": "AQ==",
+                    "nonce": DUMMY_NONCE,
+                    "ciphertext": DUMMY_CIPHERTEXT,
+                    "signature": DUMMY_SIGNATURE,
                 },
             }
         )
@@ -669,9 +758,9 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
                     "from": "mallory",
                     "to": "bob",
                     "sender_ephemeral_public_key": alice.key_agreement_public_key,
-                    "nonce": "AAAAAAAAAAAAAAAA",
-                    "ciphertext": "AQ==",
-                    "signature": "AQ==",
+                    "nonce": DUMMY_NONCE,
+                    "ciphertext": DUMMY_CIPHERTEXT,
+                    "signature": DUMMY_SIGNATURE,
                 },
             }
         )
@@ -701,9 +790,9 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
                     "from": "alice",
                     "to": "bob",
                     "sender_ephemeral_public_key": alice.key_agreement_public_key,
-                    "nonce": "AAAAAAAAAAAAAAAA",
-                    "ciphertext": "AQ==",
-                    "signature": "AQ==",
+                    "nonce": DUMMY_NONCE,
+                    "ciphertext": DUMMY_CIPHERTEXT,
+                    "signature": DUMMY_SIGNATURE,
                 },
             }
         )
@@ -763,6 +852,25 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(MessageCryptoError):
             bob.decrypt_incoming_message(forged)
+
+    async def test_recipient_rejects_replayed_incoming_message(self) -> None:
+        alice = await self.make_peer("alice")
+        bob = await self.make_peer("bob")
+        await alice.authenticate()
+        await bob.authenticate()
+
+        await alice.send_encrypted_message("bob", "hello")
+        incoming = await bob.recv()
+        self.assertIsNotNone(incoming)
+        assert incoming is not None
+
+        replay_cache = EnvelopeReplayCache()
+        self.assertEqual(
+            bob.decrypt_incoming_message(incoming, replay_cache=replay_cache),
+            "hello",
+        )
+        with self.assertRaises(MessageCryptoError):
+            bob.decrypt_incoming_message(incoming, replay_cache=replay_cache)
 
     async def test_rename_is_rejected(self) -> None:
         alice = await self.make_peer("alice")
@@ -963,10 +1071,10 @@ class ProtocolValidationTests(unittest.TestCase):
                         "timestamp": current_envelope_timestamp(),
                         "from": "alice",
                         "to": "bob",
-                        "sender_ephemeral_public_key": "abc",
-                        "nonce": "def",
+                        "sender_ephemeral_public_key": DUMMY_PUBLIC_KEY,
+                        "nonce": DUMMY_NONCE,
                         "ciphertext": "   ",
-                        "signature": "ghi",
+                        "signature": DUMMY_SIGNATURE,
                     },
                 }
             )
@@ -983,10 +1091,10 @@ class ProtocolValidationTests(unittest.TestCase):
                         "timestamp": current_envelope_timestamp(),
                         "from": "alice",
                         "to": "mallory",
-                        "sender_ephemeral_public_key": "abc",
-                        "nonce": "def",
-                        "ciphertext": "ghi",
-                        "signature": "jkl",
+                        "sender_ephemeral_public_key": DUMMY_PUBLIC_KEY,
+                        "nonce": DUMMY_NONCE,
+                        "ciphertext": DUMMY_CIPHERTEXT,
+                        "signature": DUMMY_SIGNATURE,
                     },
                 }
             )
@@ -1003,10 +1111,10 @@ class ProtocolValidationTests(unittest.TestCase):
                         "timestamp": current_envelope_timestamp(),
                         "from": "bad name",
                         "to": "bob",
-                        "sender_ephemeral_public_key": "abc",
-                        "nonce": "def",
-                        "ciphertext": "ghi",
-                        "signature": "jkl",
+                        "sender_ephemeral_public_key": DUMMY_PUBLIC_KEY,
+                        "nonce": DUMMY_NONCE,
+                        "ciphertext": DUMMY_CIPHERTEXT,
+                        "signature": DUMMY_SIGNATURE,
                     },
                 }
             )
@@ -1049,6 +1157,24 @@ class ProtocolValidationTests(unittest.TestCase):
     def test_validate_message_requires_bundle_fields_in_user_bundle(self) -> None:
         with self.assertRaises(ProtocolError):
             validate_message({"type": "user_bundle", "username": "alice"})
+
+
+class EnvelopeValidationTests(unittest.TestCase):
+    def test_parse_encrypted_envelope_rejects_wrong_nonce_length(self) -> None:
+        with self.assertRaises(MessageCryptoError):
+            parse_encrypted_envelope(
+                {
+                    "message_id": "00000000-0000-4000-8000-000000000010",
+                    "protocol_version": "messenger-e2ee-envelope:v1",
+                    "timestamp": current_envelope_timestamp(),
+                    "from": "alice",
+                    "to": "bob",
+                    "sender_ephemeral_public_key": DUMMY_PUBLIC_KEY,
+                    "nonce": base64.b64encode(b"\x00" * 11).decode("ascii"),
+                    "ciphertext": DUMMY_CIPHERTEXT,
+                    "signature": DUMMY_SIGNATURE,
+                }
+            )
 
 
 class TlsConfigurationTests(unittest.TestCase):

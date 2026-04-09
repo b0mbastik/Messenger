@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from shared.e2ee import EncryptedEnvelope, EnvelopeReplayCache
 from shared.identity import PublicIdentity
 
 
@@ -27,6 +28,7 @@ class SessionStore:
         self._by_username: dict[str, Session] = {}
         self._by_writer: dict[Any, Session] = {}
         self._by_signing_key: dict[str, Session] = {}
+        self._recent_envelopes = EnvelopeReplayCache()
 
     def register(
         self,
@@ -91,3 +93,6 @@ class SessionStore:
 
     def active_sessions(self) -> list[Session]:
         return list(self._by_writer.values())
+
+    def check_and_remember_envelope(self, envelope: EncryptedEnvelope) -> None:
+        self._recent_envelopes.check_and_remember(envelope)

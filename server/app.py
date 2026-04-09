@@ -499,6 +499,22 @@ async def handle_client(
                     log(f"delivery error {session.username} -> {recipient_name}: user missing")
                     continue
 
+                try:
+                    store.check_and_remember_envelope(envelope)
+                except MessageCryptoError as exc:
+                    await send_message(
+                        writer,
+                        {
+                            "type": "delivery_error",
+                            "text": f"Invalid encrypted envelope: {exc}",
+                        },
+                    )
+                    log(
+                        "delivery error "
+                        f"{session.username} -> {recipient_name}: rejected envelope ({exc})"
+                    )
+                    continue
+
                 delivered = await safe_send(
                     recipient.writer,
                     {
