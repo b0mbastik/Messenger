@@ -117,7 +117,9 @@ async def handle_client(
     log(f"connect {address} {format_tls_details(writer)}")
 
     try:
-        first_message = await read_message(reader, allowed_types={"register", "login"})
+        first_message = await read_message(
+            reader, allowed_types={"register", "login", "recover_certificate"}
+        )
         if first_message is None:
             log(f"disconnect {address} before registration")
             return
@@ -240,39 +242,6 @@ async def handle_client(
                 return
 
             try:
-                validate_client_certificate(
-                    first_message["identity_certificate"],
-                    username,
-                    public_identity.signing_public_key,
-                    ca_certificate,
-                )
-            except CertificateError as exc:
-                await safe_send(
-                    writer,
-                    {
-                        "type": "register_error",
-                        "text": f"Client certificate error: {exc}",
-                    },
-                )
-                log(f"rejected login from {address}: certificate error ({exc})")
-                return
-
-            if not accounts.matches_identity(
-                username,
-                public_identity.signing_public_key,
-                first_message["identity_certificate"],
-            ):
-                await safe_send(
-                    writer,
-                    {
-                        "type": "register_error",
-                        "text": "Stored identity for this username does not match the presented certificate.",
-                    },
-                )
-                log(f"rejected login from {address}: stored identity mismatch ('{username}')")
-                return
-
-            try:
                 password_valid, migrated_password = accounts.verify_or_set_password(username, password)
             except AccountRegistryError as exc:
                 await safe_send(
@@ -295,6 +264,51 @@ async def handle_client(
                 )
                 log(f"rejected login from {address}: invalid password ('{username}')")
                 return
+
+            if auth_mode == "login":
+                try:
+                    validate_client_certificate(
+                        first_message["identity_certificate"],
+                        username,
+                        public_identity.signing_public_key,
+                        ca_certificate,
+                    )
+                except CertificateError as exc:
+                    await safe_send(
+                        writer,
+                        {
+                            "type": "register_error",
+                            "text": f"Client certificate error: {exc}",
+                        },
+                    )
+                    log(f"rejected login from {address}: certificate error ({exc})")
+                    return
+
+                if not accounts.matches_identity(
+                    username,
+                    public_identity.signing_public_key,
+                    first_message["identity_certificate"],
+                ):
+                    await safe_send(
+                        writer,
+                        {
+                            "type": "register_error",
+                            "text": "Stored identity for this username does not match the presented certificate.",
+                        },
+                    )
+                    log(f"rejected login from {address}: stored identity mismatch ('{username}')")
+                    return
+            else:
+                if account.signing_public_key != public_identity.signing_public_key:
+                    await safe_send(
+                        writer,
+                        {
+                            "type": "register_error",
+                            "text": "Stored identity for this username does not match the local identity.",
+                        },
+                    )
+                    log(f"rejected certificate recovery from {address}: stored identity mismatch ('{username}')")
+                    return
 
         assert account is not None
         if account.key_agreement_public_key != public_identity.key_agreement_public_key:
@@ -339,7 +353,12 @@ async def handle_client(
                 "text": f"Welcome, {username}. Type /help to see commands.",
             },
         )
-        status = "registered" if created_account else "authenticated"
+        if created_account:
+            status = "registered"
+        elif auth_mode == "recover_certificate":
+            status = "recovered certificate and authenticated"
+        else:
+            status = "authenticated"
         if migrated_password:
             status += " with password migration"
         log(

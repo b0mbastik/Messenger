@@ -31,6 +31,13 @@ _SCHEMAS: dict[str, dict[str, type | tuple[type, ...]]] = {
         "key_agreement_signature": str,
         "identity_certificate": str,
     },
+    "recover_certificate": {
+        "username": str,
+        "password": str,
+        "signing_public_key": str,
+        "key_agreement_public_key": str,
+        "key_agreement_signature": str,
+    },
     "register_ok": {"username": str, "identity_certificate": str},
     "register_error": {"text": str},
     "list_users": {},

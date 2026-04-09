@@ -14,7 +14,6 @@ from pathlib import Path
 
 from ca.cert_utils import load_ca_certificate, load_ca_private_key
 from ca.tls_utils import build_client_ssl_context, build_server_ssl_context, parse_tls_version
-from client.session import clear_password_session, load_saved_password, save_password_session
 from server.accounts import AccountRegistry, hash_password, verify_password
 from server.app import handle_client, shutdown_clients
 from server.storage import SessionStore
@@ -61,6 +60,8 @@ class TestPeer:
         self.ca_certificate = ca_certificate
         self.username = username
         self.password = password
+        self.identity_path = identity_dir / "identity.json"
+        self.existing_identity = self.identity_path.exists()
         self.identity = load_or_create_identity(
             identity_dir,
             passphrase=password,
@@ -84,6 +85,8 @@ class TestPeer:
         self, username: str | None = None
     ) -> tuple[dict[str, object] | None, dict[str, object] | None]:
         if self.certificate_pem is None:
+            if self.existing_identity:
+                return await self.recover_certificate(username)
             return await self.register(username)
         return await self.login(username)
 
@@ -128,6 +131,27 @@ class TestPeer:
                     claimed_username
                 ),
                 "identity_certificate": certificate,
+            }
+        )
+        return await self._receive_auth_response()
+
+    async def recover_certificate(
+        self,
+        username: str | None = None,
+        *,
+        password: str | None = None,
+    ) -> tuple[dict[str, object] | None, dict[str, object] | None]:
+        claimed_username = username or self.username
+        await self.send(
+            {
+                "type": "recover_certificate",
+                "username": claimed_username,
+                "password": password or self.password,
+                "signing_public_key": self.signing_public_key,
+                "key_agreement_public_key": self.key_agreement_public_key,
+                "key_agreement_signature": self.identity.sign_key_agreement_binding(
+                    claimed_username
+                ),
             }
         )
         return await self._receive_auth_response()
@@ -207,6 +231,7 @@ class TestPeer:
             return response, None
 
         self._store_certificate(str(response["identity_certificate"]))
+        self.existing_identity = True
         welcome = await self.recv()
         return response, welcome
 
@@ -455,6 +480,43 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
             welcome,
             {"type": "system_message", "text": "Welcome, alice. Type /help to see commands."},
         )
+
+    async def test_recover_certificate_succeeds_when_local_certificate_is_missing(self) -> None:
+        alice = await self.make_peer("alice")
+        await alice.register()
+        alice_identity_dir = alice.identity.path.parent
+        alice_certificate_path = alice.certificate_path
+        await alice.disconnect()
+        alice_certificate_path.unlink()
+
+        alice_again = await self.make_peer("alice", identity_dir=alice_identity_dir)
+        self.assertIsNone(alice_again.certificate_pem)
+        recover_ok, welcome = await alice_again.recover_certificate()
+        self.assertEqual(recover_ok["type"], "register_ok")
+        self.assertEqual(recover_ok["username"], "alice")
+        self.assertIn("BEGIN CERTIFICATE", str(recover_ok["identity_certificate"]))
+        self.assertEqual(
+            welcome,
+            {"type": "system_message", "text": "Welcome, alice. Type /help to see commands."},
+        )
+        self.assertTrue(alice_certificate_path.exists())
+
+    async def test_recover_certificate_rejects_wrong_identity(self) -> None:
+        alice = await self.make_peer("alice")
+        await alice.register()
+        await alice.disconnect()
+
+        impostor = await self.make_peer("alice")
+        response, welcome = await impostor.recover_certificate()
+        self.assertEqual(
+            response,
+            {
+                "type": "register_error",
+                "text": "Stored identity for this username does not match the local identity.",
+            },
+        )
+        self.assertIsNone(welcome)
+        self.assertIsNone(await impostor.recv())
 
     async def test_register_and_list_users(self) -> None:
         alice = await self.make_peer("alice")
@@ -836,6 +898,16 @@ class ProtocolValidationTests(unittest.TestCase):
                 }
             )
 
+    def test_validate_message_requires_identity_fields_for_certificate_recovery(self) -> None:
+        with self.assertRaises(ProtocolError):
+            validate_message(
+                {
+                    "type": "recover_certificate",
+                    "username": "alice",
+                    "password": "pw",
+                }
+            )
+
     def test_validate_message_requires_certificate_in_register_ok(self) -> None:
         with self.assertRaises(ProtocolError):
             validate_message({"type": "register_ok", "username": "alice"})
@@ -895,19 +967,6 @@ class AccountRegistryTests(unittest.TestCase):
             account = registry.get("alice")
             assert account is not None
             self.assertTrue(account.has_password)
-
-
-class LocalSessionTests(unittest.TestCase):
-    def test_saved_password_round_trip(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            save_password_session(temp_dir, "alice", TEST_ACCOUNT_PASSWORD)
-            self.assertEqual(load_saved_password(temp_dir, "alice"), TEST_ACCOUNT_PASSWORD)
-
-    def test_clear_saved_password_removes_session(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            save_password_session(temp_dir, "alice", TEST_ACCOUNT_PASSWORD)
-            clear_password_session(temp_dir)
-            self.assertIsNone(load_saved_password(temp_dir, "alice"))
 
 
 class IdentityTests(unittest.TestCase):
