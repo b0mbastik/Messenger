@@ -18,6 +18,7 @@ from shared.e2ee import (
     RecipientBundle,
     decrypt_message_from_sender,
     encrypt_message_for_recipient,
+    parse_encrypted_envelope,
     validate_recipient_bundle,
 )
 from shared.identity import (
@@ -29,7 +30,14 @@ from shared.identity import (
     load_or_create_identity,
 )
 from shared.paths import DEFAULT_CA_CERT_PATH, resolve_project_path
-from shared.protocol import DEFAULT_HOST, DEFAULT_PORT, ProtocolError, read_message, send_message
+from shared.protocol import (
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    ProtocolError,
+    is_valid_username,
+    read_message,
+    send_message,
+)
 
 
 HELP_TEXT = """Available commands:
@@ -39,6 +47,10 @@ HELP_TEXT = """Available commands:
 /quit                  disconnect and exit"""
 PASSWORD_ENV = "MESSENGER_PASSWORD"
 LEGACY_IDENTITY_PASSPHRASE_ENV = "MESSENGER_IDENTITY_PASSPHRASE"
+USERNAME_REQUIREMENTS = (
+    "Username must be 1-32 characters, start with a letter or digit, "
+    "and use only letters, digits, '.', '_' or '-'."
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,10 +91,6 @@ def print_line(prefix: str, text: str, *, reprompt: bool = False) -> None:
     if reprompt:
         sys.stdout.write("> ")
     sys.stdout.flush()
-
-
-def is_valid_username(username: str) -> bool:
-    return bool(username.strip()) and " " not in username and len(username) <= 32
 
 
 async def open_stdin_reader() -> asyncio.StreamReader:
@@ -194,7 +202,7 @@ class MessengerClient:
             if not is_valid_username(username):
                 print_line(
                     "[error]: ",
-                    "Username must be 1-32 characters and contain no spaces.",
+                    USERNAME_REQUIREMENTS,
                 )
                 continue
 
@@ -457,7 +465,7 @@ class MessengerClient:
             {
                 "type": "direct_message",
                 "to": target,
-                **envelope,
+                "envelope": envelope,
             },
         )
         print_line(f"[to {target}]: ", text)
@@ -484,18 +492,16 @@ class MessengerClient:
         assert self.identity is not None
         assert self.username is not None
 
-        sender_username = str(message["from"])
+        sender_username = "unknown"
         try:
+            envelope = parse_encrypted_envelope(message["envelope"])
+            sender_username = envelope.sender_username
             plaintext = decrypt_message_from_sender(
                 self.identity,
                 self.username,
-                sender_username,
                 str(message["signing_public_key"]),
                 str(message["identity_certificate"]),
-                str(message["sender_ephemeral_public_key"]),
-                str(message["nonce"]),
-                str(message["ciphertext"]),
-                str(message["signature"]),
+                envelope,
                 self.ca_certificate,
             )
         except MessageCryptoError as exc:

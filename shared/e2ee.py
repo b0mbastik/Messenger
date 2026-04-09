@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime, timedelta, timezone
+import json
 import os
 from dataclasses import dataclass
+import uuid
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -23,10 +26,14 @@ from shared.identity import (
     encode_public_key_bytes,
     verify_key_agreement_binding,
 )
+from shared.protocol import is_valid_username
 
 HKDF_INFO_CONTEXT = b"messenger-e2ee:key:v1"
 AEAD_AAD_CONTEXT = b"messenger-e2ee:aad:v1"
 SIGNATURE_CONTEXT = b"messenger-e2ee:signature:v1"
+ENVELOPE_PROTOCOL_VERSION = "messenger-e2ee-envelope:v1"
+ENVELOPE_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S+00:00"
+MAX_ENVELOPE_CLOCK_SKEW = timedelta(minutes=5)
 NONCE_SIZE = 12
 AES_KEY_SIZE = 32
 
@@ -44,6 +51,39 @@ class RecipientBundle:
     key_agreement_public_key: str
     key_agreement_signature: str
     identity_certificate: str
+
+
+@dataclass(slots=True, frozen=True)
+class EncryptedEnvelope:
+    """Signed encrypted message envelope passed through the server."""
+
+    message_id: str
+    protocol_version: str
+    timestamp: str
+    sender_username: str
+    recipient_username: str
+    sender_ephemeral_public_key: str
+    nonce: str
+    ciphertext: str
+    signature: str
+
+    def as_message(self) -> dict[str, str]:
+        return {
+            "message_id": self.message_id,
+            "protocol_version": self.protocol_version,
+            "timestamp": self.timestamp,
+            "from": self.sender_username,
+            "to": self.recipient_username,
+            "sender_ephemeral_public_key": self.sender_ephemeral_public_key,
+            "nonce": self.nonce,
+            "ciphertext": self.ciphertext,
+            "signature": self.signature,
+        }
+
+    def unsigned_message(self) -> dict[str, str]:
+        payload = self.as_message()
+        payload.pop("signature")
+        return payload
 
 
 def validate_recipient_bundle(
@@ -98,48 +138,65 @@ def encrypt_message_for_recipient(
         sender_ephemeral_public_key=sender_ephemeral_public_key,
         recipient_key_agreement_public_key=recipient_bundle.key_agreement_public_key,
     )
+    message_id = str(uuid.uuid4())
+    timestamp = _format_envelope_timestamp(datetime.now(timezone.utc))
     nonce = os.urandom(NONCE_SIZE)
-    aad = _build_aad(
-        sender_username,
-        recipient_bundle.username,
-        sender_ephemeral_public_key,
+    unsigned_envelope = EncryptedEnvelope(
+        message_id=message_id,
+        protocol_version=ENVELOPE_PROTOCOL_VERSION,
+        timestamp=timestamp,
+        sender_username=sender_username,
+        recipient_username=recipient_bundle.username,
+        sender_ephemeral_public_key=sender_ephemeral_public_key,
+        nonce=_encode_base64(nonce),
+        ciphertext="",
+        signature="",
     )
+    aad = _build_aad(unsigned_envelope)
     ciphertext = AESGCM(derived_key).encrypt(nonce, plaintext_bytes, aad)
-    signature = sender_identity.signing_private_key.sign(
-        _build_signature_payload(
-            sender_username,
-            recipient_bundle.username,
-            sender_ephemeral_public_key,
-            nonce,
-            ciphertext,
-        )
+    envelope = EncryptedEnvelope(
+        message_id=message_id,
+        protocol_version=ENVELOPE_PROTOCOL_VERSION,
+        timestamp=timestamp,
+        sender_username=sender_username,
+        recipient_username=recipient_bundle.username,
+        sender_ephemeral_public_key=sender_ephemeral_public_key,
+        nonce=_encode_base64(nonce),
+        ciphertext=_encode_base64(ciphertext),
+        signature="",
     )
-    return {
-        "sender_ephemeral_public_key": sender_ephemeral_public_key,
-        "nonce": _encode_base64(nonce),
-        "ciphertext": _encode_base64(ciphertext),
-        "signature": _encode_base64(signature),
-    }
+    signature = sender_identity.signing_private_key.sign(_build_signature_payload(envelope))
+    return EncryptedEnvelope(
+        message_id=envelope.message_id,
+        protocol_version=envelope.protocol_version,
+        timestamp=envelope.timestamp,
+        sender_username=envelope.sender_username,
+        recipient_username=envelope.recipient_username,
+        sender_ephemeral_public_key=envelope.sender_ephemeral_public_key,
+        nonce=envelope.nonce,
+        ciphertext=envelope.ciphertext,
+        signature=_encode_base64(signature),
+    ).as_message()
 
 
 def decrypt_message_from_sender(
     recipient_identity: ClientIdentity,
     recipient_username: str,
-    sender_username: str,
     sender_signing_public_key: str,
     sender_identity_certificate: str,
-    sender_ephemeral_public_key: str,
-    nonce: str,
-    ciphertext: str,
-    signature: str,
+    envelope: EncryptedEnvelope | object,
     ca_certificate: x509.Certificate,
 ) -> str:
     """Verify and decrypt an incoming direct message."""
 
+    parsed_envelope = parse_encrypted_envelope(envelope)
+    if parsed_envelope.recipient_username != recipient_username:
+        raise MessageCryptoError("Encrypted envelope recipient does not match this client.")
+
     try:
         validate_client_certificate(
             sender_identity_certificate,
-            sender_username,
+            parsed_envelope.sender_username,
             sender_signing_public_key,
             ca_certificate,
         )
@@ -151,14 +208,8 @@ def decrypt_message_from_sender(
             decode_key_bytes(sender_signing_public_key)
         )
         sender_public_key.verify(
-            decode_key_bytes(signature),
-            _build_signature_payload(
-                sender_username,
-                recipient_username,
-                sender_ephemeral_public_key,
-                _decode_base64(nonce),
-                _decode_base64(ciphertext),
-            ),
+            decode_key_bytes(parsed_envelope.signature),
+            _build_signature_payload(parsed_envelope),
         )
     except Exception as exc:
         raise MessageCryptoError(f"Message signature verification failed: {exc}") from exc
@@ -166,20 +217,87 @@ def decrypt_message_from_sender(
     try:
         derived_key = _derive_message_key(
             recipient_identity.key_agreement_private_key,
-            peer_public_key=sender_ephemeral_public_key,
-            sender_username=sender_username,
+            peer_public_key=parsed_envelope.sender_ephemeral_public_key,
+            sender_username=parsed_envelope.sender_username,
             recipient_username=recipient_username,
-            sender_ephemeral_public_key=sender_ephemeral_public_key,
+            sender_ephemeral_public_key=parsed_envelope.sender_ephemeral_public_key,
             recipient_key_agreement_public_key=recipient_identity.public_identity.key_agreement_public_key,
         )
         plaintext = AESGCM(derived_key).decrypt(
-            _decode_base64(nonce),
-            _decode_base64(ciphertext),
-            _build_aad(sender_username, recipient_username, sender_ephemeral_public_key),
+            _decode_base64(parsed_envelope.nonce),
+            _decode_base64(parsed_envelope.ciphertext),
+            _build_aad(parsed_envelope),
         )
         return plaintext.decode("utf-8")
     except Exception as exc:
         raise MessageCryptoError(f"Message decryption failed: {exc}") from exc
+
+
+def parse_encrypted_envelope(envelope: EncryptedEnvelope | object) -> EncryptedEnvelope:
+    """Validate and normalize an encrypted envelope."""
+
+    if isinstance(envelope, EncryptedEnvelope):
+        return envelope
+    if not isinstance(envelope, dict):
+        raise MessageCryptoError("Encrypted envelope must be a JSON object.")
+
+    required_fields = {
+        "message_id": "message_id",
+        "protocol_version": "protocol_version",
+        "timestamp": "timestamp",
+        "from": "sender_username",
+        "to": "recipient_username",
+        "sender_ephemeral_public_key": "sender_ephemeral_public_key",
+        "nonce": "nonce",
+        "ciphertext": "ciphertext",
+        "signature": "signature",
+    }
+    values: dict[str, str] = {}
+    for field_name, normalized_name in required_fields.items():
+        raw_value = envelope.get(field_name)
+        if not isinstance(raw_value, str) or not raw_value.strip():
+            raise MessageCryptoError(
+                f"Encrypted envelope field '{field_name}' must be a non-empty string."
+            )
+        values[normalized_name] = raw_value
+
+    try:
+        uuid.UUID(values["message_id"])
+    except ValueError as exc:
+        raise MessageCryptoError("Encrypted envelope message_id must be a valid UUID.") from exc
+
+    if values["protocol_version"] != ENVELOPE_PROTOCOL_VERSION:
+        raise MessageCryptoError(
+            "Encrypted envelope protocol_version is not supported by this client."
+        )
+
+    _parse_envelope_timestamp(values["timestamp"])
+
+    for field_name in ("sender_username", "recipient_username"):
+        if not is_valid_username(values[field_name]):
+            raise MessageCryptoError(
+                f"Encrypted envelope {field_name.removesuffix('_username')} must be a valid username."
+            )
+
+    return EncryptedEnvelope(**values)
+
+
+def validate_envelope_timestamp_freshness(
+    envelope: EncryptedEnvelope,
+    *,
+    now: datetime | None = None,
+    max_skew: timedelta = MAX_ENVELOPE_CLOCK_SKEW,
+) -> datetime:
+    """Reject envelopes that are too far from the server's current UTC clock."""
+
+    parsed_timestamp = _parse_envelope_timestamp(envelope.timestamp)
+    current_time = now or datetime.now(timezone.utc)
+    skew = abs(current_time - parsed_timestamp)
+    if skew > max_skew:
+        raise MessageCryptoError(
+            "Encrypted envelope timestamp is outside the allowed clock-skew window."
+        )
+    return parsed_timestamp
 
 
 def _derive_message_key(
@@ -228,39 +346,41 @@ def _build_hkdf_info(
 
 
 def _build_aad(
-    sender_username: str,
-    recipient_username: str,
-    sender_ephemeral_public_key: str,
+    envelope: EncryptedEnvelope,
 ) -> bytes:
-    return b"\x00".join(
-        (
-            AEAD_AAD_CONTEXT,
-            sender_username.encode("utf-8"),
-            recipient_username.encode("utf-8"),
-            decode_key_bytes(sender_ephemeral_public_key),
-        )
+    return AEAD_AAD_CONTEXT + _canonical_json_bytes(
+        {
+            "message_id": envelope.message_id,
+            "protocol_version": envelope.protocol_version,
+            "timestamp": envelope.timestamp,
+            "from": envelope.sender_username,
+            "to": envelope.recipient_username,
+            "sender_ephemeral_public_key": envelope.sender_ephemeral_public_key,
+        }
     )
 
 
-def _build_signature_payload(
-    sender_username: str,
-    recipient_username: str,
-    sender_ephemeral_public_key: str,
-    nonce: bytes,
-    ciphertext: bytes,
-) -> bytes:
-    digest = hashes.Hash(hashes.SHA256())
-    digest.update(ciphertext)
-    return b"\x00".join(
-        (
-            SIGNATURE_CONTEXT,
-            sender_username.encode("utf-8"),
-            recipient_username.encode("utf-8"),
-            decode_key_bytes(sender_ephemeral_public_key),
-            nonce,
-            digest.finalize(),
+def _build_signature_payload(envelope: EncryptedEnvelope) -> bytes:
+    return SIGNATURE_CONTEXT + _canonical_json_bytes(envelope.unsigned_message())
+
+
+def _canonical_json_bytes(payload: dict[str, str]) -> bytes:
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+def _format_envelope_timestamp(timestamp: datetime) -> str:
+    return timestamp.astimezone(timezone.utc).strftime(ENVELOPE_TIMESTAMP_FORMAT)
+
+
+def _parse_envelope_timestamp(timestamp: str) -> datetime:
+    try:
+        return datetime.strptime(timestamp, ENVELOPE_TIMESTAMP_FORMAT).replace(
+            tzinfo=timezone.utc
         )
-    )
+    except ValueError as exc:
+        raise MessageCryptoError(
+            "Encrypted envelope timestamp must be UTC RFC 3339 text with whole seconds."
+        ) from exc
 
 
 def _encode_base64(data: bytes) -> str:

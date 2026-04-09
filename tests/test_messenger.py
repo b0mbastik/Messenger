@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 import json
 import shutil
 import ssl
@@ -22,6 +23,7 @@ from shared.e2ee import (
     RecipientBundle,
     decrypt_message_from_sender,
     encrypt_message_for_recipient,
+    parse_encrypted_envelope,
     validate_recipient_bundle,
 )
 from shared.identity import (
@@ -37,6 +39,10 @@ from shared.identity import (
 from shared.protocol import ProtocolError, read_message, send_message, validate_message
 
 TEST_ACCOUNT_PASSWORD = "test-password"
+
+
+def current_envelope_timestamp(*, offset: timedelta = timedelta()) -> str:
+    return (datetime.now(timezone.utc) + offset).strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
 
 class TestPeer:
@@ -194,19 +200,16 @@ class TestPeer:
             bundle,
             plaintext,
         )
-        await self.send({"type": "direct_message", "to": recipient, **envelope})
+        await self.send({"type": "direct_message", "to": recipient, "envelope": envelope})
 
     def decrypt_incoming_message(self, message: dict[str, object]) -> str:
+        envelope = parse_encrypted_envelope(message["envelope"])
         return decrypt_message_from_sender(
             self.identity,
             self.username,
-            str(message["from"]),
             str(message["signing_public_key"]),
             str(message["identity_certificate"]),
-            str(message["sender_ephemeral_public_key"]),
-            str(message["nonce"]),
-            str(message["ciphertext"]),
-            str(message["signature"]),
+            envelope,
             self.ca_certificate,
         )
 
@@ -616,7 +619,7 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(incoming)
         assert incoming is not None
         self.assertEqual(incoming["type"], "incoming_message")
-        self.assertEqual(incoming["from"], "alice")
+        self.assertEqual(incoming["envelope"]["from"], "alice")
         self.assertEqual(bob.decrypt_incoming_message(incoming), "hello")
 
     async def test_direct_message_to_missing_user_returns_delivery_error(self) -> None:
@@ -627,10 +630,17 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
             {
                 "type": "direct_message",
                 "to": "nobody",
-                "sender_ephemeral_public_key": alice.key_agreement_public_key,
-                "nonce": "AAAAAAAAAAAAAAAA",
-                "ciphertext": "AQ==",
-                "signature": "AQ==",
+                "envelope": {
+                    "message_id": "00000000-0000-4000-8000-000000000001",
+                    "protocol_version": "messenger-e2ee-envelope:v1",
+                    "timestamp": current_envelope_timestamp(),
+                    "from": "alice",
+                    "to": "nobody",
+                    "sender_ephemeral_public_key": alice.key_agreement_public_key,
+                    "nonce": "AAAAAAAAAAAAAAAA",
+                    "ciphertext": "AQ==",
+                    "signature": "AQ==",
+                },
             }
         )
         response = await alice.recv()
@@ -639,6 +649,70 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
             {
                 "type": "delivery_error",
                 "text": "User 'nobody' is not connected.",
+            },
+        )
+
+    async def test_direct_message_rejects_spoofed_envelope_sender(self) -> None:
+        alice = await self.make_peer("alice")
+        bob = await self.make_peer("bob")
+        await alice.authenticate()
+        await bob.authenticate()
+
+        await alice.send(
+            {
+                "type": "direct_message",
+                "to": "bob",
+                "envelope": {
+                    "message_id": "00000000-0000-4000-8000-000000000002",
+                    "protocol_version": "messenger-e2ee-envelope:v1",
+                    "timestamp": current_envelope_timestamp(),
+                    "from": "mallory",
+                    "to": "bob",
+                    "sender_ephemeral_public_key": alice.key_agreement_public_key,
+                    "nonce": "AAAAAAAAAAAAAAAA",
+                    "ciphertext": "AQ==",
+                    "signature": "AQ==",
+                },
+            }
+        )
+        response = await alice.recv()
+        self.assertEqual(
+            response,
+            {
+                "type": "delivery_error",
+                "text": "Encrypted envelope sender does not match the authenticated session.",
+            },
+        )
+
+    async def test_direct_message_rejects_stale_envelope_timestamp(self) -> None:
+        alice = await self.make_peer("alice")
+        bob = await self.make_peer("bob")
+        await alice.authenticate()
+        await bob.authenticate()
+
+        await alice.send(
+            {
+                "type": "direct_message",
+                "to": "bob",
+                "envelope": {
+                    "message_id": "00000000-0000-4000-8000-000000000003",
+                    "protocol_version": "messenger-e2ee-envelope:v1",
+                    "timestamp": current_envelope_timestamp(offset=timedelta(minutes=-10)),
+                    "from": "alice",
+                    "to": "bob",
+                    "sender_ephemeral_public_key": alice.key_agreement_public_key,
+                    "nonce": "AAAAAAAAAAAAAAAA",
+                    "ciphertext": "AQ==",
+                    "signature": "AQ==",
+                },
+            }
+        )
+        response = await alice.recv()
+        self.assertEqual(
+            response,
+            {
+                "type": "delivery_error",
+                "text": "Invalid encrypted envelope: Encrypted envelope timestamp is outside the allowed clock-skew window.",
             },
         )
 
@@ -667,7 +741,8 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(incoming)
         assert incoming is not None
         tampered = dict(incoming)
-        tampered["ciphertext"] = "Ag=="
+        tampered["envelope"] = dict(incoming["envelope"])
+        tampered["envelope"]["ciphertext"] = "Ag=="
 
         with self.assertRaises(MessageCryptoError):
             bob.decrypt_incoming_message(tampered)
@@ -683,7 +758,8 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(incoming)
         assert incoming is not None
         forged = dict(incoming)
-        forged["from"] = "mallory"
+        forged["envelope"] = dict(incoming["envelope"])
+        forged["envelope"]["from"] = "mallory"
 
         with self.assertRaises(MessageCryptoError):
             bob.decrypt_incoming_message(forged)
@@ -847,12 +923,23 @@ class MessengerServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_username_is_rejected(self) -> None:
         peer = await self.make_peer("alice")
 
-        response, welcome = await peer.register("bad name")
+        await peer.send(
+            {
+                "type": "register",
+                "username": "bad name",
+                "password": TEST_ACCOUNT_PASSWORD,
+                "signing_public_key": peer.signing_public_key,
+                "key_agreement_public_key": peer.key_agreement_public_key,
+                "key_agreement_signature": "AQ==",
+            }
+        )
+        response = await peer.recv()
+        welcome = await peer.recv()
         self.assertEqual(
             response,
             {
                 "type": "register_error",
-                "text": "Username must be 1-32 characters and contain no spaces.",
+                "text": "Username must be 1-32 characters, start with a letter or digit, and use only letters, digits, '.', '_' or '-'.",
             },
         )
         self.assertIsNone(welcome)
@@ -870,10 +957,57 @@ class ProtocolValidationTests(unittest.TestCase):
                 {
                     "type": "direct_message",
                     "to": "bob",
-                    "sender_ephemeral_public_key": "abc",
-                    "nonce": "def",
-                    "ciphertext": "   ",
-                    "signature": "ghi",
+                    "envelope": {
+                        "message_id": "00000000-0000-4000-8000-000000000001",
+                        "protocol_version": "messenger-e2ee-envelope:v1",
+                        "timestamp": current_envelope_timestamp(),
+                        "from": "alice",
+                        "to": "bob",
+                        "sender_ephemeral_public_key": "abc",
+                        "nonce": "def",
+                        "ciphertext": "   ",
+                        "signature": "ghi",
+                    },
+                }
+            )
+
+    def test_validate_message_rejects_direct_message_routing_mismatch(self) -> None:
+        with self.assertRaises(ProtocolError):
+            validate_message(
+                {
+                    "type": "direct_message",
+                    "to": "bob",
+                    "envelope": {
+                        "message_id": "00000000-0000-4000-8000-000000000001",
+                        "protocol_version": "messenger-e2ee-envelope:v1",
+                        "timestamp": current_envelope_timestamp(),
+                        "from": "alice",
+                        "to": "mallory",
+                        "sender_ephemeral_public_key": "abc",
+                        "nonce": "def",
+                        "ciphertext": "ghi",
+                        "signature": "jkl",
+                    },
+                }
+            )
+
+    def test_validate_message_rejects_invalid_envelope_username(self) -> None:
+        with self.assertRaises(ProtocolError):
+            validate_message(
+                {
+                    "type": "direct_message",
+                    "to": "bob",
+                    "envelope": {
+                        "message_id": "00000000-0000-4000-8000-000000000004",
+                        "protocol_version": "messenger-e2ee-envelope:v1",
+                        "timestamp": current_envelope_timestamp(),
+                        "from": "bad name",
+                        "to": "bob",
+                        "sender_ephemeral_public_key": "abc",
+                        "nonce": "def",
+                        "ciphertext": "ghi",
+                        "signature": "jkl",
+                    },
                 }
             )
 

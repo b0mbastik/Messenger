@@ -22,6 +22,7 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
 )
 
 from shared.paths import DEFAULT_IDENTITIES_ROOT
+from shared.protocol import is_valid_username
 
 IDENTITY_FILE = "identity.json"
 IDENTITY_CERT_FILE = "identity-cert.pem"
@@ -289,9 +290,10 @@ def build_key_agreement_binding_payload(
 ) -> bytes:
     """Return the canonical payload signed to bind a user to an X25519 key."""
 
+    if not is_valid_username(username):
+        raise IdentityError("Username must be valid to bind the key-agreement key.")
+
     username_bytes = username.encode("utf-8")
-    if not username_bytes.strip():
-        raise IdentityError("Username must be present to bind the key-agreement key.")
 
     key_bytes = decode_key_bytes(key_agreement_public_key)
     return (
@@ -316,6 +318,8 @@ def verify_key_agreement_binding(
         )
     except InvalidSignature as exc:
         raise IdentityError("Key-agreement public key signature is invalid.") from exc
+
+
 def encode_public_key_bytes(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 

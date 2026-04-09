@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8888
 
 Message = dict[str, Any]
+USERNAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}")
 
 
 class ProtocolError(Exception):
@@ -53,19 +55,12 @@ _SCHEMAS: dict[str, dict[str, type | tuple[type, ...]]] = {
     "user_bundle_error": {"username": str, "text": str},
     "direct_message": {
         "to": str,
-        "sender_ephemeral_public_key": str,
-        "nonce": str,
-        "ciphertext": str,
-        "signature": str,
+        "envelope": dict,
     },
     "incoming_message": {
-        "from": str,
         "signing_public_key": str,
         "identity_certificate": str,
-        "sender_ephemeral_public_key": str,
-        "nonce": str,
-        "ciphertext": str,
-        "signature": str,
+        "envelope": dict,
     },
     "delivery_error": {"text": str},
     "system_message": {"text": str},
@@ -110,6 +105,12 @@ def validate_message(message: object, *, allowed_types: set[str] | None = None) 
         if not all(isinstance(user, str) and user.strip() for user in users):
             raise ProtocolError("'users' must contain non-empty strings")
 
+    if message_type in {"direct_message", "incoming_message"}:
+        _validate_encrypted_envelope(message["envelope"])
+
+    if message_type == "direct_message" and message["to"] != message["envelope"]["to"]:
+        raise ProtocolError("direct_message routing target must match encrypted envelope recipient")
+
     return dict(message)
 
 
@@ -153,3 +154,34 @@ def _type_name(expected_type: type | tuple[type, ...]) -> str:
     if isinstance(expected_type, tuple):
         return " or ".join(item.__name__ for item in expected_type)
     return expected_type.__name__
+
+
+def _validate_encrypted_envelope(envelope: object) -> None:
+    if not isinstance(envelope, dict):
+        raise ProtocolError("encrypted envelope must be a JSON object")
+
+    required_fields = (
+        "message_id",
+        "protocol_version",
+        "timestamp",
+        "from",
+        "to",
+        "sender_ephemeral_public_key",
+        "nonce",
+        "ciphertext",
+        "signature",
+    )
+    for field in required_fields:
+        value = envelope.get(field)
+        if not isinstance(value, str):
+            raise ProtocolError(f"encrypted envelope field '{field}' must be str")
+        if not value.strip():
+            raise ProtocolError(f"encrypted envelope field '{field}' must not be empty")
+
+    for field in ("from", "to"):
+        if not is_valid_username(envelope[field]):
+            raise ProtocolError(f"encrypted envelope field '{field}' must contain a valid username")
+
+
+def is_valid_username(username: object) -> bool:
+    return isinstance(username, str) and USERNAME_PATTERN.fullmatch(username) is not None

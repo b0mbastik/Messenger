@@ -17,6 +17,11 @@ from ca.tls_utils import build_server_ssl_context, parse_tls_version
 from cryptography import x509
 from server.accounts import AccountRegistry, AccountRegistryError
 from server.storage import SessionStore
+from shared.e2ee import (
+    MessageCryptoError,
+    parse_encrypted_envelope,
+    validate_envelope_timestamp_freshness,
+)
 from shared.identity import (
     IdentityError,
     validate_public_identity,
@@ -30,7 +35,19 @@ from shared.paths import (
     DEFAULT_SERVER_KEY_PATH,
     resolve_project_path,
 )
-from shared.protocol import DEFAULT_HOST, DEFAULT_PORT, ProtocolError, read_message, send_message
+from shared.protocol import (
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    ProtocolError,
+    is_valid_username,
+    read_message,
+    send_message,
+)
+
+USERNAME_REQUIREMENTS = (
+    "Username must be 1-32 characters, start with a letter or digit, "
+    "and use only letters, digits, '.', '_' or '-'."
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -93,10 +110,6 @@ def format_tls_details(writer: asyncio.StreamWriter) -> str:
     return f"using {protocol} ({cipher_name})"
 
 
-def is_valid_username(username: str) -> bool:
-    return bool(username.strip()) and " " not in username and len(username) <= 32
-
-
 async def safe_send(writer: asyncio.StreamWriter, message: dict[str, object]) -> bool:
     try:
         await send_message(writer, message)
@@ -148,7 +161,7 @@ async def handle_client(
                 writer,
                 {
                     "type": "register_error",
-                    "text": "Username must be 1-32 characters and contain no spaces.",
+                    "text": USERNAME_REQUIREMENTS,
                 },
             )
             log(f"rejected registration from {address}: invalid username '{username}'")
@@ -413,6 +426,66 @@ async def handle_client(
 
             if message_type == "direct_message":
                 recipient_name = message["to"]
+                try:
+                    envelope = parse_encrypted_envelope(message["envelope"])
+                except MessageCryptoError as exc:
+                    await send_message(
+                        writer,
+                        {
+                            "type": "delivery_error",
+                            "text": f"Invalid encrypted envelope: {exc}",
+                        },
+                    )
+                    log(
+                        "delivery error "
+                        f"{session.username} -> {recipient_name}: invalid envelope ({exc})"
+                    )
+                    continue
+
+                if envelope.sender_username != session.username:
+                    await send_message(
+                        writer,
+                        {
+                            "type": "delivery_error",
+                            "text": "Encrypted envelope sender does not match the authenticated session.",
+                        },
+                    )
+                    log(
+                        "delivery error "
+                        f"{session.username} -> {recipient_name}: sender mismatch in envelope"
+                    )
+                    continue
+
+                if envelope.recipient_username != recipient_name:
+                    await send_message(
+                        writer,
+                        {
+                            "type": "delivery_error",
+                            "text": "Encrypted envelope recipient does not match the routing target.",
+                        },
+                    )
+                    log(
+                        "delivery error "
+                        f"{session.username} -> {recipient_name}: recipient mismatch in envelope"
+                    )
+                    continue
+
+                try:
+                    validate_envelope_timestamp_freshness(envelope)
+                except MessageCryptoError as exc:
+                    await send_message(
+                        writer,
+                        {
+                            "type": "delivery_error",
+                            "text": f"Invalid encrypted envelope: {exc}",
+                        },
+                    )
+                    log(
+                        "delivery error "
+                        f"{session.username} -> {recipient_name}: stale envelope timestamp ({exc})"
+                    )
+                    continue
+
                 recipient = store.get_by_username(recipient_name)
 
                 if recipient is None:
@@ -430,13 +503,9 @@ async def handle_client(
                     recipient.writer,
                     {
                         "type": "incoming_message",
-                        "from": session.username,
                         "signing_public_key": session.public_identity.signing_public_key,
                         "identity_certificate": session.identity_certificate,
-                        "sender_ephemeral_public_key": message["sender_ephemeral_public_key"],
-                        "nonce": message["nonce"],
-                        "ciphertext": message["ciphertext"],
-                        "signature": message["signature"],
+                        "envelope": envelope.as_message(),
                     },
                 )
                 if not delivered:
@@ -459,7 +528,8 @@ async def handle_client(
                 log(
                     "message "
                     f"{session.username} -> {recipient_name}: "
-                    f"{len(str(message['ciphertext']))} base64 bytes"
+                    f"id={envelope.message_id} "
+                    f"{len(envelope.ciphertext)} base64 bytes"
                 )
                 continue
 
